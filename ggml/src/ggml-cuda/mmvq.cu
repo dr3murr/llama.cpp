@@ -93,6 +93,20 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
+// Rows per block for GP100. Only the K-quants are raised: 4 was measured best for
+// them (1/2/4/8 -> 40.8/48.3/52.2/51.3 tg on llama-3.1-8b Q4_K_M), and 4 also keeps
+// q4_1 inside test-backend-ops' 5e-4 NMSE bound, which it exceeds at higher values.
+// Everything else uses 2, which is worth ~4% tg on a mixed-type model: Qwen3.8-27B
+// UD-Q4_K_XL spends ~7% of its decode in iq4_xs plus more in iq4_nl/iq3_s/q8_0, and
+// 19.36 -> 21.79 tg depends on those getting 2 rather than 1. 4 is not used for them
+// because q4_1 leaves test-backend-ops' 5e-4 NMSE bound for MUL_MAT there.
+#ifndef GGML_CUDA_MMVQ_ROWS_PASCAL_K
+#define GGML_CUDA_MMVQ_ROWS_PASCAL_K 4
+#endif
+#ifndef GGML_CUDA_MMVQ_ROWS_PASCAL
+#define GGML_CUDA_MMVQ_ROWS_PASCAL 2
+#endif
+
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
     MMVQ_PARAMETERS_TURING,
@@ -100,7 +114,8 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
     MMVQ_PARAMETERS_RDNA4,
-    MMVQ_PARAMETERS_GB10
+    MMVQ_PARAMETERS_GB10,
+    MMVQ_PARAMETERS_PASCAL
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -116,6 +131,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_TURING;
 #elif __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
     return MMVQ_PARAMETERS_GB10;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+    // GP100 only. sm_61 (P40/P4) has __dp4a and keeps the generic parameters.
+    return MMVQ_PARAMETERS_PASCAL;
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
@@ -139,6 +157,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
         return MMVQ_PARAMETERS_GB10;
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_PASCAL) {
+        return MMVQ_PARAMETERS_PASCAL;
     }
     return MMVQ_PARAMETERS_GENERIC;
 }
@@ -554,6 +575,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 return 1;
         }
     }
+    if (table_id == MMVQ_PARAMETERS_PASCAL) {
+        return calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC, small_k, halve_iters);
+    }
     if (table_id == MMVQ_PARAMETERS_GB10) {
         const int generic = calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
         // Only worth the wider block when it actually retires the K loop in half the trips (Observation)
@@ -593,6 +617,30 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (table_id == MMVQ_PARAMETERS_PASCAL) {
+        // GP100 emulates __dp4a, so mul_mat_vec_q is instruction-issue bound rather than
+        // bandwidth bound. Handling several rows per block shares the activation loads
+        // and unpacking between them instead of repeating that work for every row.
+        // Only the batch-size-1 case is retuned here. Everything else defers to the
+        // generic table -- returning 2 for every ncols_dst > 1 silently diverged from
+        // it (generic gives 2 only for 2..8, and 1 above that), which hurt MoE routing.
+        if (ncols_dst != 1) {
+            return calc_rows_per_block(type, ncols_dst, MMVQ_PARAMETERS_GENERIC, small_k, nwarps);
+        }
+        if (small_k) {
+            return nwarps;
+        }
+        switch (type) {
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+                return GGML_CUDA_MMVQ_ROWS_PASCAL_K;
+            default:
+                return GGML_CUDA_MMVQ_ROWS_PASCAL;
+        }
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
