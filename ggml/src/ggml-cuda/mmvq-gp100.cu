@@ -1337,6 +1337,8 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     ggml_cuda_pool_alloc<char> tmp(ctx.pool());
     char * base;
+    size_t off_ys  = GP100_OFF_YS;
+    size_t off_s16 = GP100_OFF_S16;
     bool   hit = false;
     if (gp100_cache_enabled() && K * ncols <= GP100_ACT_CACHE_MAX_K) {
         gp100_act_cache & c = gp100_cache(ctx);
@@ -1344,11 +1346,16 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         c.src1 = src1; c.data = src1->data; c.K = K; c.ncols = ncols; c.epoch = ctx.graph_epoch;
         base = c.buf;
     } else {
-        base = tmp.alloc(GP100_ACT_BYTES);
+        // sized for THIS matmul: a fixed GP100_ACT_BYTES overflows once K * ncols > GP100_ACT_CACHE_MAX_K
+        // (e.g. a DFlash drafter's fc, K = 25600, at 6+ columns)
+        const int64_t n = std::max<int64_t>(K * ncols, GP100_ACT_CACHE_MAX_K);
+        off_ys  = GGML_PAD(n * sizeof(half), 256);
+        off_s16 = off_ys + GGML_PAD(n / 32 * sizeof(float2), 256);
+        base = tmp.alloc(off_s16 + n / 16 * sizeof(float));
     }
     half   * y   = (half   *) base;
-    float2 * ys  = (float2 *) (base + GP100_OFF_YS);
-    float  * s16 = (float  *) (base + GP100_OFF_S16);
+    float2 * ys  = (float2 *) (base + off_ys);
+    float  * s16 = (float  *) (base + off_s16);
     if (!hit) {
         const int nblk = nb32 * ncols;
         gp100_prep_act<<<(nblk + 3) / 4, 128, 0, stream>>>((const float *) src1->data, y, ys, s16, nblk, nb32, src1->nb[1] / sizeof(float));
