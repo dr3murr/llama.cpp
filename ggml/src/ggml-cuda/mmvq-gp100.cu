@@ -1219,11 +1219,14 @@ static void gp100_dispatch_r(const ggml_type type, const void * W, const void * 
             }
             GGML_ABORT("IQ4_NL supports at most 4 rows per warp");
         case GGML_TYPE_Q6_K:
-            if constexpr (R <= 4) {
+            // Must match the clamp in gp100_dispatch: at most 4 rows per warp, 2 with GLU (the GLU staging
+            // doubles). Instantiating kernels the clamp never launches only grows the static shared memory
+            // that ptxas must accept; CUDA 12.8+ rejects any instantiation over sm_60's 48 KB.
+            if constexpr (R <= (GLU ? 2 : 4)) {
                 GP100_LAUNCH((gp100_mmvq_q6_K<R, GLU>));
                 break;
             }
-            GGML_ABORT("Q6_K supports at most 4 rows per warp");
+            GGML_ABORT("Q6_K supports at most 4 rows per warp, 2 with GLU");
         default: GGML_ABORT("unsupported type for the GP100 MMVQ path");
     }
 #undef GP100_LAUNCH
