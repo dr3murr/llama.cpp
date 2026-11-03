@@ -1096,22 +1096,389 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
 }
 
+// ---- 32-weight-unit kernel: IQ2_S, IQ3_XXS, IQ3_S (grid codebooks), IQ4_NL and Q2_0, plain or MUL_MAT_ID ----
+// Rows only need 4-byte alignment (expert rows of K = 640 IQ4_NL are 360 bytes). A warp stages a chunk of 32
+// units (32 weights each) of RT rows into shared memory with coalesced 4-byte loads, then each lane decodes one
+// unit. Codebook magnitudes become subnormal halves as above; signs are applied by XOR-ing the half sign bits
+// with masks from a 256-entry table (sign byte -> four half2 masks), so a group of 8 weights costs one table
+// load. Grids and sign tables live in shared memory (random lookups); blocks are persistent so they are filled
+// once per block. With ids, blockIdx.y is (token, expert slot) and selects the expert matrix, the activation
+// column and the output column.
+template <ggml_type type> struct gp100_u;
+template <> struct gp100_u<GGML_TYPE_IQ2_S>   { typedef block_iq2_s   block; static constexpr int UPB = 8; static constexpr int GW = 2048; static constexpr int NS = 256; };
+template <> struct gp100_u<GGML_TYPE_IQ3_XXS> { typedef block_iq3_xxs block; static constexpr int UPB = 8; static constexpr int GW = 256;  static constexpr int NS = 128; };
+template <> struct gp100_u<GGML_TYPE_IQ3_S>   { typedef block_iq3_s   block; static constexpr int UPB = 8; static constexpr int GW = 512;  static constexpr int NS = 256; };
+template <> struct gp100_u<GGML_TYPE_IQ4_NL>  { typedef block_iq4_nl  block; static constexpr int UPB = 1; static constexpr int GW = 0;    static constexpr int NS = 0;   };
+template <> struct gp100_u<GGML_TYPE_Q2_0>    { typedef block_q2_0    block; static constexpr int UPB = 2; static constexpr int GW = 0;    static constexpr int NS = 0;   };
+
+static constexpr int GP100_U_NW = 8; // warps per block
+
+struct gp100_u_args {
+    int64_t         row_bytes;    // src0 nb[1]
+    int64_t         expert_bytes; // src0 nb[2]
+    const int32_t * ids;          // nullptr: plain matmul, one column
+    int             ids_stride;   // ids nb[1] / 4
+    int             n_used;       // expert slots per token (1 without ids)
+    int             ne11;         // src1 columns per token: 1 (broadcast) or n_used
+    int             dst_s1;       // dst nb[1] / 4
+    int             dst_s2;       // dst nb[2] / 4
+    int             nrows;
+    int             nblk;         // blocks per row
+};
+
+// sign byte -> XOR masks for the half2 pairs (w0,w1), (w2,w3), (w4,w5), (w6,w7)
+static __device__ __forceinline__ uint4 gp100_sign_masks(const uint32_t s) {
+    return make_uint4(((s &  1u) << 15) | ((s &   2u) << 30), ((s &  4u) << 13) | ((s &   8u) << 28),
+                      ((s & 16u) << 11) | ((s &  32u) << 26), ((s & 64u) <<  9) | ((s & 128u) << 24));
+}
+
+static __device__ __forceinline__ uint32_t gp100_u32_at(const uint16_t * p) { // 2-byte aligned shared load
+    return (uint32_t) p[0] | ((uint32_t) p[1] << 16);
+}
+
+// 8 weights: two 4-byte codebook entries a (w0..3) and b (w4..7), sign masks m, activations Y[0..3]
+static __device__ __forceinline__ half2 gp100_grid8(const uint32_t a, const uint32_t b, const uint4 m, const half2 * Y, half2 acc) {
+    const uint32_t p0 = __byte_perm(a, 0, 0x4140) ^ m.x;
+    const uint32_t p1 = __byte_perm(a, 0, 0x4342) ^ m.y;
+    const uint32_t p2 = __byte_perm(b, 0, 0x4140) ^ m.z;
+    const uint32_t p3 = __byte_perm(b, 0, 0x4342) ^ m.w;
+    acc = __hfma2(*(const half2 *) &p0, Y[0], acc);
+    acc = __hfma2(*(const half2 *) &p1, Y[1], acc);
+    acc = __hfma2(*(const half2 *) &p2, Y[2], acc);
+    acc = __hfma2(*(const half2 *) &p3, Y[3], acc);
+    return acc;
+}
+
+// One unit (32 weights, unit j of the block at bb in shared memory) dotted with the fp16 activations Y of the
+// matching 32-block; sc = {rescale, fp32 sum of the block's x}. Returns the fp32 contribution.
+template <ggml_type type>
+static __device__ __forceinline__ float gp100_unit(const uint8_t * bb, const int j, const half2 * Y, const float2 sc,
+                                                   const uint32_t * grid, const uint4 * sgn) {
+    const uint16_t * b16 = (const uint16_t *) bb;
+    const float      d   = __half2float(__ushort_as_half(b16[0]));
+    if constexpr (type == GGML_TYPE_IQ3_XXS) {
+        // qs[0..63]: one grid index per 4 weights; qs[64..95]: per unit, 4 x 7-bit sign indices + 4-bit scale
+        const uint32_t q0  = gp100_u32_at(b16 + 1 + 4*j);
+        const uint32_t q1  = gp100_u32_at(b16 + 3 + 4*j);
+        const uint32_t aux = gp100_u32_at(b16 + 33 + 2*j);
+        half2 acc = __float2half2_rn(0.0f);
+#pragma unroll
+        for (int g = 0; g < 4; g++) {
+            const uint32_t q = g < 2 ? q0 : q1;
+            const int      s = 16 * (g % 2);
+            acc = gp100_grid8(grid[(q >> s) & 0xFF], grid[(q >> (s + 8)) & 0xFF], sgn[(aux >> (7*g)) & 127], Y + 4*g, acc);
+        }
+        const float sum = __low2float(acc) + __high2float(acc);
+        return d * (0.5f + (float) (aux >> 28)) * 0.5f * sum * sc.x;
+    } else if constexpr (type == GGML_TYPE_IQ3_S) {
+        // qs[0..63] at 2: low 8 bits of the index per 4 weights; qh[8] at 66; signs[32] at 74; scales[4] at 106
+        const uint32_t q0 = gp100_u32_at(b16 + 1 + 4*j);
+        const uint32_t q1 = gp100_u32_at(b16 + 3 + 4*j);
+        const uint32_t qh = bb[66 + j];
+        const uint32_t sg = gp100_u32_at(b16 + 37 + 2*j);
+        const int      ls = (bb[106 + j/2] >> (4 * (j & 1))) & 0x0F;
+        half2 acc = __float2half2_rn(0.0f);
+#pragma unroll
+        for (int g = 0; g < 4; g++) {
+            const uint32_t q  = g < 2 ? q0 : q1;
+            const int      s  = 16 * (g % 2);
+            const uint32_t ia = ((q >> s)       & 0xFF) | ((qh << (8 - 2*g)) & 0x100);
+            const uint32_t ib = ((q >> (s + 8)) & 0xFF) | ((qh << (7 - 2*g)) & 0x100);
+            acc = gp100_grid8(grid[ia], grid[ib], sgn[(sg >> (8*g)) & 0xFF], Y + 4*g, acc);
+        }
+        const float sum = __low2float(acc) + __high2float(acc);
+        return d * (float) (1 + 2*ls) * sum * sc.x;
+    } else if constexpr (type == GGML_TYPE_IQ2_S) {
+        // qs[0..31] at 2: low 8 bits of the index per 8 weights; qs[32..63] at 34: sign bytes; qh[8] at 66; scales at 74
+        const uint32_t qi = gp100_u32_at(b16 + 1 + 2*j);
+        const uint32_t sg = gp100_u32_at(b16 + 17 + 2*j);
+        const uint32_t qh = bb[66 + j];
+        const uint32_t ls = bb[74 + j];
+        half2 acc0 = __float2half2_rn(0.0f);
+        half2 acc1 = __float2half2_rn(0.0f);
+#pragma unroll
+        for (int g = 0; g < 4; g++) {
+            const uint32_t idx = ((qi >> (8*g)) & 0xFF) | ((qh << (8 - 2*g)) & 0x300);
+            const uint2    gr  = *(const uint2 *) (grid + 2*idx);
+            if (g < 2) {
+                acc0 = gp100_grid8(gr.x, gr.y, sgn[(sg >> (8*g)) & 0xFF], Y + 4*g, acc0);
+            } else {
+                acc1 = gp100_grid8(gr.x, gr.y, sgn[(sg >> (8*g)) & 0xFF], Y + 4*g, acc1);
+            }
+        }
+        const float s0 = __low2float(acc0) + __high2float(acc0);
+        const float s1 = __low2float(acc1) + __high2float(acc1);
+        return d * 0.25f * ((0.5f + (float) (ls & 0x0F)) * s0 + (0.5f + (float) (ls >> 4)) * s1) * sc.x;
+    } else if constexpr (type == GGML_TYPE_IQ4_NL) {
+        // qs[k] low nibble = weight k, high = weight k+16; looked up +128 as in gp100_mmvq_b32
+        constexpr uint32_t T0 = 0x3F2D1801u, T1 = 0x766A5D4Fu, T2 = 0xA6998D81u, T3 = 0xF1D9C5B5u;
+        half2 acc = __float2half2_rn(0.0f);
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint32_t q  = gp100_u32_at(b16 + 1 + 2*k);
+            const uint32_t qx = q ^ 0x88888888u;
+            const uint32_t S  = ((q >> 1) & 0x44444444u) | 0x32103210u;
+            const uint32_t v0 = gp100_prmt(gp100_prmt(T0, T1, q),       gp100_prmt(T2, T3, qx),       S);
+            const uint32_t v1 = gp100_prmt(gp100_prmt(T0, T1, q >> 16), gp100_prmt(T2, T3, qx >> 16), S >> 16);
+            const uint32_t pa = __byte_perm(v0, 0, 0x4240);
+            const uint32_t pb = __byte_perm(v1, 0, 0x4240);
+            const uint32_t pc = __byte_perm(v0, 0, 0x4341);
+            const uint32_t pd = __byte_perm(v1, 0, 0x4341);
+            acc = __hfma2(*(const half2 *) &pa, Y[2*k + 0],     acc);
+            acc = __hfma2(*(const half2 *) &pb, Y[2*k + 1],     acc);
+            acc = __hfma2(*(const half2 *) &pc, Y[8 + 2*k + 0], acc);
+            acc = __hfma2(*(const half2 *) &pd, Y[8 + 2*k + 1], acc);
+        }
+        const float s = __low2float(acc) + __high2float(acc);
+        return d * fmaf(s, sc.x, -128.0f * sc.y);
+    } else { // Q2_0: 64 weights per block, code c (2 bits, weight i at bit 2i of qs) means c - 1; unit j = weights 32j..
+        half2 acc = __float2half2_rn(0.0f);
+#pragma unroll
+        for (int h = 0; h < 2; h++) { // 16 weights per 32-bit word
+            const uint32_t w  = gp100_u32_at(b16 + 1 + 4*j + 2*h);
+            const uint32_t * Yw = (const uint32_t *) (Y + 8*h);
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                // byte b of x holds weight 4b+k: halves (k, 4+k) and (8+k, 12+k)
+                const uint32_t x  = (w >> (2*k)) & 0x03030303u;
+                const uint32_t pa = __byte_perm(x, 0, 0x4140);
+                const uint32_t pb = __byte_perm(x, 0, 0x4342);
+                const uint32_t ya = __byte_perm(Yw[k/2],     Yw[2 + k/2], (k & 1) ? 0x7632 : 0x5410); // y_k, y_{4+k}
+                const uint32_t yb = __byte_perm(Yw[4 + k/2], Yw[6 + k/2], (k & 1) ? 0x7632 : 0x5410); // y_{8+k}, y_{12+k}
+                acc = __hfma2(*(const half2 *) &pa, *(const half2 *) &ya, acc);
+                acc = __hfma2(*(const half2 *) &pb, *(const half2 *) &yb, acc);
+            }
+        }
+        const float s = __low2float(acc) + __high2float(acc);
+        return d * fmaf(s, sc.x, -sc.y);
+    }
+}
+
+template <ggml_type type, int R, bool GLU>
+static __global__ void __launch_bounds__(GP100_U_NW * WARP_SIZE) gp100_mmvq_u(
+        const char * __restrict__ W, const char * __restrict__ G, const half * __restrict__ y, const float2 * __restrict__ ys,
+        float * __restrict__ dst, const gp100_u_args a) {
+#if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+    typedef gp100_u<type> T;
+    constexpr int RT = GLU ? 2*R : R;
+    constexpr int BS = sizeof(typename T::block);
+    constexpr int CB = 32 / T::UPB;            // blocks per chunk: one unit per lane
+    constexpr int CW = (CB * BS + 3) / 4;      // 32-bit words per chunk and row
+    constexpr int NL = (CW + WARP_SIZE - 1) / WARP_SIZE;
+    constexpr int GW = T::GW > 0 ? T::GW : 1;
+    constexpr int NS = T::NS > 0 ? T::NS : 1;
+    __shared__ uint32_t               stage[GP100_U_NW][RT][CW];
+    __shared__ __align__(16) uint32_t grid[GW];
+    __shared__ uint4                  sgn[NS];
+
+    if constexpr (T::GW > 0) {
+        const uint32_t * src = type == GGML_TYPE_IQ2_S ? (const uint32_t *) iq2s_grid :
+                               type == GGML_TYPE_IQ3_XXS ? iq3xxs_grid : iq3s_grid;
+        for (int i = threadIdx.x; i < T::GW; i += blockDim.x) {
+            grid[i] = src[i];
+        }
+        for (int i = threadIdx.x; i < T::NS; i += blockDim.x) {
+            // IQ3_XXS stores 7 sign bits, the 8th makes the count even
+            const uint32_t s = type == GGML_TYPE_IQ3_XXS ? i | ((__popc(i) & 1) << 7) : i;
+            sgn[i] = gp100_sign_masks(s);
+        }
+        __syncthreads();
+    }
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+
+    // (token, slot) of this block row
+    const int slot = blockIdx.y % a.n_used;
+    const int tok  = blockIdx.y / a.n_used;
+    if (a.ids) {
+        const int64_t e = a.ids[tok * a.ids_stride + slot];
+        if (e < 0) { // skipped slot: nothing to compute or store
+            return;
+        }
+        W += e * a.expert_bytes;
+        if (GLU) {
+            G += e * a.expert_bytes;
+        }
+    }
+    const int64_t col = tok * a.ne11 + (a.ne11 == 1 ? 0 : slot);
+    const int     nb32 = a.nblk * T::UPB;
+    y   += col * nb32 * 32;
+    ys  += col * nb32;
+    dst += slot * a.dst_s1 + tok * a.dst_s2;
+
+    // Steps are (row group, chunk) pairs; the weights of the next step are loaded before the current one is
+    // decoded, so one memory latency overlaps the decode instead of preceding it.
+    const int nrg    = (a.nrows + R - 1) / R;
+    const int nchunk = (a.nblk + CB - 1) / CB;
+    const int rgs    = gridDim.x * GP100_U_NW;
+
+    const auto load = [&](uint32_t (&v)[RT][NL], const int rg, const int c) {
+        const int b0 = c * CB;
+        const int nw = (min(a.nblk - b0, CB) * BS + 3) / 4;
+#pragma unroll
+        for (int r = 0; r < RT; r++) {
+            const char * row = ((GLU && r >= R) ? G : W) + (int64_t) min(rg * R + r % R, a.nrows - 1) * a.row_bytes;
+            const uint32_t * src = (const uint32_t *) row + b0 * BS / 4; // b0 * BS is a multiple of 4: CB * BS is
+#pragma unroll
+            for (int k = 0; k < NL; k++) {
+                const int i = lane + WARP_SIZE * k;
+                v[r][k] = i < nw ? __ldg(src + i) : 0u;
+            }
+        }
+    };
+
+    int rg = blockIdx.x * GP100_U_NW + warp;
+    int c  = 0;
+    uint32_t v[RT][NL];
+    if (rg < nrg) {
+        load(v, rg, 0);
+    }
+    float sum[RT];
+#pragma unroll
+    for (int r = 0; r < RT; r++) {
+        sum[r] = 0.0f;
+    }
+    while (rg < nrg) {
+        int c_n  = c + 1;
+        int rg_n = rg;
+        if (c_n == nchunk) {
+            c_n   = 0;
+            rg_n += rgs;
+        }
+        uint32_t vn[RT][NL];
+        if (rg_n < nrg) {
+            load(vn, rg_n, c_n);
+        }
+
+        __syncwarp(); // the previous step's decode is done with the stage
+#pragma unroll
+        for (int r = 0; r < RT; r++) {
+#pragma unroll
+            for (int k = 0; k < NL; k++) {
+                const int i = lane + WARP_SIZE * k;
+                if (i < CW) {
+                    stage[warp][r][i] = v[r][k];
+                }
+            }
+        }
+        __syncwarp();
+
+        const int b0 = c * CB;
+        if (lane < min(a.nblk - b0, CB) * T::UPB) {
+            const int     b     = b0 * T::UPB + lane; // 32-block of the activations
+            const uint4 * yp    = (const uint4 *) (y + 32 * b);
+            const uint4   yv[4] = {__ldg(yp), __ldg(yp + 1), __ldg(yp + 2), __ldg(yp + 3)};
+            const float2  sc    = __ldg(ys + b);
+            const int     bi    = lane / T::UPB;
+            const int     j     = lane % T::UPB;
+#pragma unroll
+            for (int r = 0; r < RT; r++) {
+                const uint8_t * bb = (const uint8_t *) &stage[warp][r][0] + bi * BS;
+                sum[r] += gp100_unit<type>(bb, j, (const half2 *) yv, sc, grid, sgn);
+            }
+        }
+
+        if (c == nchunk - 1) {
+            gp100_store<R, GLU>(sum, dst, rg * R, a.nrows, lane);
+#pragma unroll
+            for (int r = 0; r < RT; r++) {
+                sum[r] = 0.0f;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < RT; r++) {
+#pragma unroll
+            for (int k = 0; k < NL; k++) {
+                v[r][k] = vn[r][k];
+            }
+        }
+        rg = rg_n;
+        c  = c_n;
+    }
+#else
+    GGML_UNUSED_VARS(W, G, y, ys, dst, a);
+    NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+}
+
+static bool gp100_u_type(const ggml_type type) {
+    return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q2_0;
+}
+
+// The b32 kernel (16-byte staged loads) keeps the plain IQ4_NL matmuls it already handles.
+static bool gp100_b32_ok(const ggml_tensor * src0) {
+    return src0->ne[0] % QK_K == 0 && src0->nb[1] % 16 == 0 && (uintptr_t) src0->data % 16 == 0;
+}
+
+static bool gp100_use_u(const ggml_tensor * src0, const ggml_tensor * ids) {
+    return gp100_u_type(src0->type) && (ids || src0->type != GGML_TYPE_IQ4_NL || !gp100_b32_ok(src0));
+}
+
+template <ggml_type type, bool GLU>
+static void gp100_launch_u(const char * W, const char * G, const half * y, const float2 * ys, float * dst, const gp100_u_args & a,
+                           const int ncolsy, const int nsm, cudaStream_t stream) {
+    // R = 4 (2 with GLU): 1, 2 and 8 rows per warp were 5-25% slower in the 64-expert test-backend-ops shapes
+    constexpr int R    = GLU ? 2 : 4;
+    const int     nrg  = (a.nrows + R - 1) / R;
+    const int     need = (nrg + GP100_U_NW - 1) / GP100_U_NW;
+    // persistent: ~4 blocks per SM over all (token, slot) pairs, so the shared tables are filled once per block
+    // (2 per SM: 15-25% slower; the shared memory and registers allow at most 2-3 resident anyway)
+    const int     nbx  = std::max(1, std::min(need, (4 * nsm + ncolsy - 1) / ncolsy));
+    gp100_mmvq_u<type, R, GLU><<<dim3(nbx, ncolsy), GP100_U_NW * WARP_SIZE, 0, stream>>>(W, G, y, ys, dst, a);
+}
+
+template <bool GLU>
+static void gp100_dispatch_u(const ggml_type type, const char * W, const char * G, const half * y, const float2 * ys, float * dst,
+                             const gp100_u_args & a, const int ncolsy, const int nsm, cudaStream_t stream) {
+    switch (type) {
+        case GGML_TYPE_IQ2_S:   gp100_launch_u<GGML_TYPE_IQ2_S,   GLU>(W, G, y, ys, dst, a, ncolsy, nsm, stream); break;
+        case GGML_TYPE_IQ3_XXS: gp100_launch_u<GGML_TYPE_IQ3_XXS, GLU>(W, G, y, ys, dst, a, ncolsy, nsm, stream); break;
+        case GGML_TYPE_IQ3_S:   gp100_launch_u<GGML_TYPE_IQ3_S,   GLU>(W, G, y, ys, dst, a, ncolsy, nsm, stream); break;
+        case GGML_TYPE_IQ4_NL:  gp100_launch_u<GGML_TYPE_IQ4_NL,  GLU>(W, G, y, ys, dst, a, ncolsy, nsm, stream); break;
+        case GGML_TYPE_Q2_0:    gp100_launch_u<GGML_TYPE_Q2_0,    GLU>(W, G, y, ys, dst, a, ncolsy, nsm, stream); break;
+        default: GGML_ABORT("unsupported type for the GP100 unit kernel");
+    }
+}
+
 bool ggml_cuda_gp100_mmvq_supported(const int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
                                     const ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
     if (cc != GGML_CUDA_CC_PASCAL || GGML_CUDA_CC_IS_AMD(cc) || GGML_CUDA_CC_IS_MTHREADS(cc)) {
         return false;
     }
     static const bool disabled = getenv("GGML_CUDA_GP100_MMVQ_DISABLE") != nullptr;
-    if (disabled || ids) {
+    if (disabled) {
         return false;
     }
     if (fusion) { // only the plain gate/up/SWIGLU fusion: no biases, no scales, no clamp, no shared-expert pass
         if (!fusion->gate || fusion->x_bias || fusion->gate_bias || fusion->x_scale || fusion->gate_scale ||
             fusion->glu_op != GGML_GLU_OP_SWIGLU || fusion->glu_limit != 0.0f ||
             fusion->shared_up || fusion->shared_gate || fusion->shared_dst || fusion->gate->type != src0->type ||
-            fusion->gate->nb[1] != src0->nb[1] || (uintptr_t) fusion->gate->data % 16 != 0) {
+            fusion->gate->nb[1] != src0->nb[1] || fusion->gate->nb[2] != src0->nb[2] ||
+            (uintptr_t) fusion->gate->data % (gp100_use_u(src0, ids) ? 4 : 16) != 0) {
             return false;
         }
+    }
+    if (gp100_use_u(src0, ids)) {
+        static const bool u_disabled = getenv("GGML_CUDA_GP100_U_DISABLE") != nullptr;
+        const int64_t K = src0->ne[0];
+        if (u_disabled || src1->type != GGML_TYPE_F32 || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+            src0->nb[1] != (size_t) ggml_row_size(src0->type, K) || src0->nb[1] % 4 != 0 || src0->nb[2] % 4 != 0 ||
+            (uintptr_t) src0->data % 4 != 0 || src0->ne[3] != 1 || src1->ne[3] != 1 || src1->nb[1] % sizeof(float) != 0) {
+            return false;
+        }
+        if (!ids) {
+            return src0->ne[2] == 1 && src1->ne[1] == 1 && src1->ne[2] == 1 && dst->ne[1] == 1;
+        }
+        // MUL_MAT_ID: src1 [K, 1 or n_used, n_tokens] with columns evenly strided, dst [N, n_used, n_tokens]
+        const int64_t n_used = ids->ne[0];
+        const int64_t ntok   = src1->ne[2];
+        return ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) && ids->ne[1] == ntok && ntok <= 8 &&
+               (src1->ne[1] == 1 || src1->ne[1] == n_used) && src1->nb[2] == src1->ne[1] * src1->nb[1] &&
+               dst->ne[1] == n_used && dst->ne[2] == ntok;
+    }
+    if (ids) {
+        return false;
     }
     switch (src0->type) {
         case GGML_TYPE_Q4_K:
@@ -1330,12 +1697,12 @@ static bool gp100_cache_enabled() {
     return !no_cache;
 }
 
-void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-                          const ggml_cuda_mm_fusion_args_host * fusion) {
+void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+                          ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
     cudaStream_t stream = ctx.stream();
     const int64_t K     = src0->ne[0];
     const int64_t nrows = src0->ne[1];
-    const int     ncols = src1->ne[1];
+    const int     ncols = src1->ne[1] * src1->ne[2]; // MUL_MAT_ID: every (slot, token) column, evenly strided
     const int     nb32  = K / 32;
 
     ggml_cuda_pool_alloc<char> tmp(ctx.pool());
@@ -1364,6 +1731,28 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         gp100_prep_act<<<(nblk + 3) / 4, 128, 0, stream>>>((const float *) src1->data, y, ys, s16, nblk, nb32, src1->nb[1] / sizeof(float));
     }
 
+    if (gp100_use_u(src0, ids)) {
+        gp100_u_args a{};
+        a.row_bytes    = src0->nb[1];
+        a.expert_bytes = src0->nb[2];
+        a.ids          = ids ? (const int32_t *) ids->data : nullptr;
+        a.ids_stride   = ids ? ids->nb[1] / sizeof(int32_t) : 0;
+        a.n_used       = ids ? ids->ne[0] : 1;
+        a.ne11         = ids ? src1->ne[1] : 1;
+        a.dst_s1       = ids ? dst->nb[1] / sizeof(float) : 0;
+        a.dst_s2       = ids ? dst->nb[2] / sizeof(float) : 0;
+        a.nrows        = nrows;
+        a.nblk         = K / ggml_blck_size(src0->type);
+        const int ncolsy = a.n_used * (ids ? src1->ne[2] : 1);
+        const int nsm    = ggml_cuda_info().devices[ctx.device].nsm;
+        if (fusion) {
+            gp100_dispatch_u<true >(src0->type, (const char *) src0->data, (const char *) fusion->gate->data, y, ys, (float *) dst->data, a, ncolsy, nsm, stream);
+        } else {
+            gp100_dispatch_u<false>(src0->type, (const char *) src0->data, nullptr, y, ys, (float *) dst->data, a, ncolsy, nsm, stream);
+        }
+        return;
+    }
+
     const int nsb        = K / QK_K;
     const int stride_row = src0->nb[1] / ggml_type_size(src0->type);
     if (ncols > 1) {
@@ -1372,6 +1761,108 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         gp100_dispatch<true >(src0->type, src0->data, fusion->gate->data, y, ys, s16, (float *) dst->data, nrows, nsb, stride_row, stream);
     } else {
         gp100_dispatch<false>(src0->type, src0->data, nullptr,            y, ys, s16, (float *) dst->data, nrows, nsb, stride_row, stream);
+    }
+}
+
+// BF16 matrix x one f32 column. The generic kernel runs one block per row and sizes the block to the row, so
+// the hyper-connection projections of K = 320 (10240 rows) become 10240 blocks of 160 threads doing 4-byte
+// loads (~95 GB/s on GP100). Here each lane reads 16 bytes (8 weights) per load: with R > 1 every warp of the
+// block takes R rows over the whole row (many rows); with R = 1 the block's NW warps split K of one row (few
+// rows, long K). bf16 -> f32 is a shift, the products accumulate in f32.
+template <int R, int NW>
+static __global__ void __launch_bounds__(NW * WARP_SIZE) gp100_mmvf_bf16(const uint4 * __restrict__ W, const float4 * __restrict__ y,
+                                                                        float * __restrict__ dst, const int nrows, const int nc8,
+                                                                        const int64_t stride_row4) {
+#if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+    constexpr int KS   = R == 1 ? NW : 1; // warps sharing a row
+    const int     lane = threadIdx.x % WARP_SIZE;
+    const int     warp = threadIdx.x / WARP_SIZE;
+    const int     row0 = (blockIdx.x * (NW / KS) + warp / KS) * R;
+
+    const uint4 * rowp[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        rowp[r] = W + (int64_t) min(row0 + r, nrows - 1) * stride_row4;
+    }
+    float sum[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+        sum[r] = 0.0f;
+    }
+#pragma unroll 4
+    for (int c = (warp % KS) * WARP_SIZE + lane; c < nc8; c += WARP_SIZE * KS) {
+        const float4 y0 = __ldg(y + 2*c);
+        const float4 y1 = __ldg(y + 2*c + 1);
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const uint4 w = __ldg(rowp[r] + c);
+            float s = sum[r];
+            s = fmaf(__uint_as_float(w.x << 16),         y0.x, s);
+            s = fmaf(__uint_as_float(w.x & 0xFFFF0000u), y0.y, s);
+            s = fmaf(__uint_as_float(w.y << 16),         y0.z, s);
+            s = fmaf(__uint_as_float(w.y & 0xFFFF0000u), y0.w, s);
+            s = fmaf(__uint_as_float(w.z << 16),         y1.x, s);
+            s = fmaf(__uint_as_float(w.z & 0xFFFF0000u), y1.y, s);
+            s = fmaf(__uint_as_float(w.w << 16),         y1.z, s);
+            s = fmaf(__uint_as_float(w.w & 0xFFFF0000u), y1.w, s);
+            sum[r] = s;
+        }
+    }
+    if constexpr (KS == 1) {
+        gp100_store<R, false>(sum, dst, row0, nrows, lane);
+    } else {
+        __shared__ float red[NW];
+        float s = sum[0];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            s += __shfl_xor_sync(0xFFFFFFFF, s, o);
+        }
+        if (lane == 0) {
+            red[warp] = s;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            s = lane < NW ? red[lane] : 0.0f;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                s += __shfl_xor_sync(0xFFFFFFFF, s, o);
+            }
+            if (lane == 0 && row0 < nrows) {
+                dst[row0] = s;
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(W, y, dst, nrows, nc8, stride_row4);
+    NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+}
+
+bool ggml_cuda_gp100_mmvf_supported(const int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+                                    const ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    static const bool disabled = getenv("GGML_CUDA_GP100_MMVF_DISABLE") != nullptr;
+    return cc == GGML_CUDA_CC_PASCAL && !disabled && !ids && !fusion && src0->type == GGML_TYPE_BF16 &&
+           src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+           dst->ne[1] == 1 && src0->ne[0] % 8 == 0 && src0->nb[0] == sizeof(ggml_bf16_t) && src0->nb[1] % 16 == 0 &&
+           src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) &&
+           (uintptr_t) src0->data % 16 == 0 && (uintptr_t) src1->data % 16 == 0;
+}
+
+void ggml_cuda_gp100_mmvf(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int     nrows  = src0->ne[1];
+    const int     nc8    = src0->ne[0] / 8;
+    const int64_t stride = src0->nb[1] / 16;
+    const uint4  * W     = (const uint4  *) src0->data;
+    const float4 * y     = (const float4 *) src1->data;
+    float        * d     = (float        *) dst->data;
+    cudaStream_t   s     = ctx.stream();
+    if (nrows >= 2048) {
+        gp100_mmvf_bf16<4, 4><<<(nrows + 15) / 16, 128, 0, s>>>(W, y, d, nrows, nc8, stride);
+    } else if (nc8 >= 16 * WARP_SIZE * 2) { // long rows (K >= 8192): 16 warps per row, ~2+ loads per lane
+        gp100_mmvf_bf16<1, 16><<<nrows, 16 * WARP_SIZE, 0, s>>>(W, y, d, nrows, nc8, stride);
+    } else {
+        gp100_mmvf_bf16<1, 4><<<nrows, 4 * WARP_SIZE, 0, s>>>(W, y, d, nrows, nc8, stride);
     }
 }
 

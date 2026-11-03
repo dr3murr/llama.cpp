@@ -12594,6 +12594,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             true, 16, 8, b, false, true, false));
     }
 
+    // Flash-Next routed experts at decode and spec-verify batch sizes: gate/up 2560 -> 640 from one shared
+    // activation (fused with the GLU or not), down 640 -> 2560 from one activation per slot (GP100 unit kernel)
+    for (int64_t n_tok : {1, 2, 4}) {
+        for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 10, true, 640, n_tok, 2560));
+            if (ggml_blck_size(type) < 256) { // K = 640 needs 32/64-weight blocks
+                test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 10, false, 2560, n_tok, 640));
+            }
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n_tok, 640, 2560,
+                true, 16, 10, true, false, true, false, {1, 1}));
+        }
+    }
+    for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
+        if (ggml_blck_size(type) < 256) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 2560, 1, 640, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 640, 2560,
+            false, 1, 1, false, false, true, false, {1, 1}));
+    }
+    // Flash-Next BF16 hyper-connection and router projections at one token (GP100 BF16 mat-vec)
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{10240, 320}, {320, 10240}, {4, 10240}, {256, 2560}, {48, 2560}, {2560, 2560}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+    }
+
     // Gate and up on the SYCL XMX kernels: rows long enough for 2D block loads, a last tile of 8 rows, and
     // columns on both sides of the 8 and 16 column tiles
     for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
@@ -13330,6 +13354,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0.0f, 0.0f,
                                                             GGML_PREC_F32, t, t));
+        }
+    }
+
+    // Flash-Next routed experts at one token: gate/up 2560 -> 640 (plain and fused with the GLU), down 640 -> 2560,
+    // 10 of 64 experts (64 keeps the weights well beyond L2)
+    for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 10, true, 640, 1, 2560));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 640, 2560,
+            true, 64, 10, true, false, true, false, {1, 1}));
+        if (ggml_blck_size(type) < 256) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 64, 10, false, 2560, 1, 640));
         }
     }
 

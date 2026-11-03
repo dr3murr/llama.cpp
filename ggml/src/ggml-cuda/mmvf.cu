@@ -2,6 +2,7 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+#include "mmvq-gp100.cuh"
 #include "mmf.cuh"
 #include "convert.cuh"
 
@@ -656,6 +657,11 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
+
+    if (ggml_cuda_gp100_mmvf_supported(cc, src0, src1, ids, dst, fusion)) {
+        ggml_cuda_gp100_mmvf(ctx, src0, src1, dst);
+        return;
+    }
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
 

@@ -1528,7 +1528,7 @@ void ggml_cuda_mul_mat_vec_q(
     float         *  dst_d =       (float         *)  dst->data;
 
     if (ggml_cuda_gp100_mmvq_supported(ggml_cuda_info().devices[ctx.device].cc, src0, src1, ids, dst, fusion)) {
-        ggml_cuda_gp100_mmvq(ctx, src0, src1, dst, fusion);
+        ggml_cuda_gp100_mmvq(ctx, src0, src1, ids, dst, fusion);
         return;
     }
 
