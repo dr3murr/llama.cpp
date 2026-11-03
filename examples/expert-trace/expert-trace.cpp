@@ -30,15 +30,16 @@ static bool trace_cb(ggml_tensor * t, bool ask, void * user_data) {
         return true;
     }
     auto * st = (trace_state *) user_data;
-    GGML_ASSERT(t->type == GGML_TYPE_I32 && ggml_is_contiguous(t));
+    // the top-k ids are a view of the argsort result: rows of ne[0] contiguous ids, strided by nb[1]
+    GGML_ASSERT(t->type == GGML_TYPE_I32 && t->nb[0] == sizeof(int32_t) && t->ne[2] == 1 && t->ne[3] == 1);
     const int layer = atoi(t->name + strlen(prefix));
-    st->buf.resize(ggml_nelements(t));
-    ggml_backend_tensor_get(t, st->buf.data(), 0, ggml_nbytes(t));
     const int64_t n_used = t->ne[0];
-    const int64_t n_tok  = ggml_nelements(t) / n_used;
+    const int64_t n_tok  = t->ne[1];
+    st->buf.resize(n_used);
     for (int64_t i = 0; i < n_tok; ++i) {
+        ggml_backend_tensor_get(t, st->buf.data(), i*t->nb[1], n_used*sizeof(int32_t));
         for (int64_t j = 0; j < n_used; ++j) {
-            st->counts[{layer, st->buf[i*n_used + j]}]++;
+            st->counts[{layer, st->buf[j]}]++;
         }
     }
     st->n_rows += n_tok;
