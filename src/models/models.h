@@ -2885,6 +2885,11 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
+        // decode-time QSA gather (LLAMA_QSA_GATHER): set by build_qsa_sel for a one-token ubatch at long
+        // context, consumed by the following build_attn_qsa of the same layer
+        ggml_tensor * qsa_gather_idx = nullptr; // I32 [n_pad] selected cells, dead and padding slots -> 0
+        int64_t       qsa_gather_n   = 0;       // n_pad: n_sel rounded up to the FA KV stride
+
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
                     ggml_tensor * cur,

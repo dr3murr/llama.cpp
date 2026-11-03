@@ -13321,6 +13321,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+    // Flash-Next QSA one-token decode at 32k/131k context (M1): block top-k over n_kv/4 pooled scores, and
+    // attention over the gathered 2304 cells vs the whole masked cache (24 q heads over 2 KV heads, hd 256)
+    for (int64_t n_pool : { 8192, 32768 }) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { n_pool, 1, 1, 1 }, 512));
+    }
+    for (int64_t kv : { 2304, 32768, 131072 }) {
+        for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0.0f, 0.0f,
+                                                            GGML_PREC_F32, t, t));
+        }
+    }
 
     return test_cases;
 }

@@ -835,6 +835,16 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
 }
 
+// LLAMA_QSA_GATHER: minimum n_kv at which one-token decode gathers the selected cells (default 16384, 0 = off)
+static int64_t qwen4exp_qsa_gather_threshold() {
+    static const int64_t thr = [] {
+        const char * s = getenv("LLAMA_QSA_GATHER");
+        const long long v = s ? atoll(s) : 16384;
+        return v > 0 ? (int64_t) v : INT64_MAX;
+    }();
+    return thr;
+}
+
 // QSA attends to the top blocks of compress_ratio cells plus the incomplete tail, like the glm5-next k-pool indexer
 // a block is scored by one pooled key: the mean of its raw indexer keys, normed and rotated to its first member
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
@@ -913,6 +923,39 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
     // flash attention requires an f16 mask
     const ggml_type type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
+    // decode and speculative verification at long context: gather each token's selected cells so attention
+    // reads n_sel rows, not n_kv. The masked path below stays dense with a mask on backends without a sparse
+    // FA kernel (e.g. Pascal).
+    qsa_gather_idx = nullptr;
+    qsa_gather_n   = 0;
+    if (n_tokens <= 8 && cparams.flash_attn && inp_kpool->n_kv >= qwen4exp_qsa_gather_threshold()) {
+        const int64_t n_kv  = inp_kpool->n_kv;
+        const int64_t n_sel = kpool*n_top_pool + inp_kpool->tail_idxs->ne[0];
+        const int64_t n_pad = GGML_PAD(n_sel, 256);
+
+        ggml_tensor * idx = ggml_get_rows(ctx0, inp_kpool->pool_idxs,
+                ggml_reshape_1d(ctx0, top_k, n_top_pool*n_tokens)); // [kpool, n_top_pool*n_tokens]
+        idx = ggml_concat(ctx0, ggml_reshape_2d(ctx0, idx, kpool*n_top_pool, n_tokens), inp_kpool->tail_idxs, 0); // [n_sel, n_tokens]
+
+        // a picked pool is live when visible (score >= 0, invisible is -inf); a tail cell unless it is the n_kv sentinel
+        ggml_tensor * top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pool, n_tokens), top_k);
+        ggml_tensor * live_pool = ggml_clamp(ctx0, ggml_scale_bias(ctx0, top_score, 1.0f, 1.0f), 0.0f, 1.0f);
+        live_pool = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, live_pool, kpool, n_top_pool, n_tokens, 1), kpool*n_top_pool, n_tokens);
+        ggml_tensor * live_tail = ggml_cast(ctx0, inp_kpool->tail_idxs, GGML_TYPE_F32);
+        live_tail = ggml_clamp(ctx0, ggml_scale_bias(ctx0, live_tail, -1.0f, (float) n_kv), 0.0f, 1.0f);
+        ggml_tensor * live = ggml_pad(ctx0, ggml_concat(ctx0, live_pool, live_tail, 0), n_pad - n_sel, 0, 0, 0); // [n_pad, n_tokens]
+
+        ggml_tensor * idx_f = ggml_pad(ctx0, ggml_cast(ctx0, idx, GGML_TYPE_F32), n_pad - n_sel, 0, 0, 0);
+        qsa_gather_idx = ggml_cast(ctx0, ggml_mul(ctx0, idx_f, live), GGML_TYPE_I32); // [n_pad, n_tokens]
+        qsa_gather_n   = n_pad;
+        cb(qsa_gather_idx, "indexer_gather_idx", il);
+
+        // 0 for live slots, log(0) = -inf for dead and padding slots
+        ggml_tensor * mask = ggml_cast(ctx0, ggml_log(ctx0, live), type_mask);
+        cb(mask, "indexer_gather_mask", il);
+        return mask;
+    }
 
     // keep the cells of the live picked pools and the tail, -inf elsewhere
     // all retained cells are in the token's sequence, so the kq_mask is not needed
@@ -1023,13 +1066,37 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // the selection replaces the kq_mask: split it into the streams of the K view
-    const int64_t n_stream = k->ne[3];
-    GGML_ASSERT(sel->ne[0] == k->ne[2] && sel->ne[1] % n_stream == 0);
-    sel = ggml_reshape_4d(ctx0, sel, sel->ne[0], sel->ne[1]/n_stream, 1, n_stream);
-    cb(sel, "kq_mask_qsa", il);
-
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, nullptr, n_sel, kq_scale, il);
+    ggml_tensor * cur = nullptr;
+    if (qsa_gather_idx) {
+        // rows of one stream are whole cells (all KV heads), so a 2D view of the cache gathers them directly;
+        // each token has its own selection, so a multi-token ubatch (speculative verification) runs one
+        // small attention per token and concatenates the outputs
+        GGML_ASSERT(k->ne[3] == 1 && sel->ne[0] == qsa_gather_n && !(v->nb[1] > v->nb[2]));
+        const int64_t n_pad = qsa_gather_n;
+        const int64_t n_tok = q->ne[2];
+        GGML_ASSERT(qsa_gather_idx->ne[1] == n_tok && sel->ne[1] == n_tok);
+        ggml_tensor * k_rows = ggml_view_2d(ctx0, k, k->ne[0]*k->ne[1], k->ne[2], k->nb[2], 0);
+        ggml_tensor * v_rows = ggml_view_2d(ctx0, v, v->ne[0]*v->ne[1], v->ne[2], v->nb[2], 0);
+        for (int64_t j = 0; j < n_tok; ++j) {
+            ggml_tensor * idx_j = ggml_view_1d(ctx0, qsa_gather_idx, n_pad, j*qsa_gather_idx->nb[1]);
+            ggml_tensor * k_j = ggml_reshape_4d(ctx0, ggml_cast(ctx0, ggml_get_rows(ctx0, k_rows, idx_j), GGML_TYPE_F16),
+                    k->ne[0], k->ne[1], n_pad, 1);
+            ggml_tensor * v_j = ggml_reshape_4d(ctx0, ggml_cast(ctx0, ggml_get_rows(ctx0, v_rows, idx_j), GGML_TYPE_F16),
+                    v->ne[0], v->ne[1], n_pad, 1);
+            ggml_tensor * q_j = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], 1, q->nb[1], q->nb[2], j*q->nb[2]);
+            ggml_tensor * m_j = ggml_reshape_4d(ctx0, ggml_view_1d(ctx0, sel, n_pad, j*sel->nb[1]), n_pad, 1, 1, 1);
+            ggml_tensor * o_j = build_attn_mha(q_j, k_j, v_j, nullptr, m_j, nullptr, nullptr, nullptr, 0, kq_scale, il);
+            cur = cur ? ggml_concat(ctx0, cur, o_j, 1) : o_j;
+        }
+        qsa_gather_idx = nullptr;
+    } else {
+        // the selection replaces the kq_mask: split it into the streams of the K view
+        const int64_t n_stream = k->ne[3];
+        GGML_ASSERT(sel->ne[0] == k->ne[2] && sel->ne[1] % n_stream == 0);
+        sel = ggml_reshape_4d(ctx0, sel, sel->ne[0], sel->ne[1]/n_stream, 1, n_stream);
+        cb(sel, "kq_mask_qsa", il);
+        cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, nullptr, n_sel, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
