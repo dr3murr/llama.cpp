@@ -10,7 +10,7 @@ bool ggml_cuda_gp100_mmvq_supported(int cc, const ggml_tensor * src0, const ggml
 void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
                           ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion);
 
-// BF16 x one f32 column (plain MUL_MAT, no fusion) with 16-byte loads; see mmvq-gp100.cu
+// BF16 x one f32 column (plain MUL_MAT, no fusion) with 16-byte loads, on every NVIDIA architecture; see mmvq-gp100.cu
 bool ggml_cuda_gp100_mmvf_supported(int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
                                     const ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion);
 

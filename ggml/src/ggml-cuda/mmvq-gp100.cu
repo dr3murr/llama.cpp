@@ -1764,16 +1764,17 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     }
 }
 
-// BF16 matrix x one f32 column. The generic kernel runs one block per row and sizes the block to the row, so
-// the hyper-connection projections of K = 320 (10240 rows) become 10240 blocks of 160 threads doing 4-byte
-// loads (~95 GB/s on GP100). Here each lane reads 16 bytes (8 weights) per load: with R > 1 every warp of the
-// block takes R rows over the whole row (many rows); with R = 1 the block's NW warps split K of one row (few
-// rows, long K). bf16 -> f32 is a shift, the products accumulate in f32.
+// BF16 matrix x one f32 column, on every NVIDIA architecture (unlike the rest of this file). The generic kernel runs
+// one block per row and sizes the block to the row, so the hyper-connection projections of K = 320 (10240 rows)
+// become 10240 blocks of 160 threads doing 4-byte loads (~95 GB/s on GP100, 16.1 us on an RTX 5080; here 21.4 and
+// 11.2 us). Each lane reads 16 bytes (8 weights) per load: with R > 1 every warp of the block takes R rows over the
+// whole row (many rows); with R = 1 the block's NW warps split K of one row (few rows, long K). bf16 -> f32 is a
+// shift, the products accumulate in f32.
 template <int R, int NW>
 static __global__ void __launch_bounds__(NW * WARP_SIZE) gp100_mmvf_bf16(const uint4 * __restrict__ W, const float4 * __restrict__ y,
                                                                         float * __restrict__ dst, const int nrows, const int nc8,
                                                                         const int64_t stride_row4) {
-#if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+#if defined(__CUDA_ARCH__)
     constexpr int KS   = R == 1 ? NW : 1; // warps sharing a row
     const int     lane = threadIdx.x % WARP_SIZE;
     const int     warp = threadIdx.x / WARP_SIZE;
@@ -1835,13 +1836,13 @@ static __global__ void __launch_bounds__(NW * WARP_SIZE) gp100_mmvf_bf16(const u
 #else
     GGML_UNUSED_VARS(W, y, dst, nrows, nc8, stride_row4);
     NO_DEVICE_CODE;
-#endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+#endif // defined(__CUDA_ARCH__)
 }
 
 bool ggml_cuda_gp100_mmvf_supported(const int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
                                     const ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
     static const bool disabled = getenv("GGML_CUDA_GP100_MMVF_DISABLE") != nullptr;
-    return cc == GGML_CUDA_CC_PASCAL && !disabled && !ids && !fusion && src0->type == GGML_TYPE_BF16 &&
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && !disabled && !ids && !fusion && src0->type == GGML_TYPE_BF16 &&
            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
            dst->ne[1] == 1 && src0->ne[0] % 8 == 0 && src0->nb[0] == sizeof(ggml_bf16_t) && src0->nb[1] % 16 == 0 &&
