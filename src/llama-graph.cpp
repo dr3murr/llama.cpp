@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-expert-shadow.h"
 #include "llama-moe-cache.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
@@ -2253,6 +2254,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                float   post_exp_norm_eps) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
+    // large graphs read experts on a secondary GPU from their host shadow, so the main GPU computes them
+    up_exps      = llama_expert_shadow_select(up_exps,      n_tokens);
+    gate_exps    = llama_expert_shadow_select(gate_exps,    n_tokens);
+    down_exps    = llama_expert_shadow_select(down_exps,    n_tokens);
+    gate_up_exps = llama_expert_shadow_select(gate_up_exps, n_tokens);
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
     ggml_tensor * logits = nullptr;

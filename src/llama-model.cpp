@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-expert-shadow.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1368,6 +1369,9 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    // host aliases of the experts on secondary GPUs (LLAMA_EXPERT_SHADOW=1)
+    std::unique_ptr<llama_expert_shadows> expert_shadows;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -2134,6 +2138,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+    }
+
+    if (const char * e = getenv("LLAMA_EXPERT_SHADOW"); e != nullptr && atoi(e) > 0 && !devices.empty()) {
+        const ggml_backend_dev_t main_dev = devices[0].dev;
+        std::vector<ggml_tensor *> cand;
+        for (const auto & [name, t] : tensors_by_name) {
+            const bool is_exps = name.find("_exps.weight") != std::string::npos &&
+                (name.find("ffn_up_exps") != std::string::npos || name.find("ffn_gate_exps") != std::string::npos ||
+                 name.find("ffn_down_exps") != std::string::npos || name.find("ffn_gate_up_exps") != std::string::npos);
+            if (!is_exps || t->buffer == nullptr) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+            if (dev != nullptr && dev != main_dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                cand.push_back(t);
+            }
+        }
+        pimpl->expert_shadows = std::make_unique<llama_expert_shadows>();
+        pimpl->expert_shadows->build(ml, cand);
     }
 
     load_tensors_hadamard();
