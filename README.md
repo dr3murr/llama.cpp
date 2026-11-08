@@ -1,3 +1,8 @@
+> **Fork:** branch `p100-qr0n` of dr3murr/llama.cpp is upstream llama.cpp plus Tesla P100 (sm_60) kernels for running
+> a P100 next to an RTX 5080. Commits, build steps, results: [P100.md](P100.md).
+> Written with AI coding agents and measured on one machine (RTX 5080 + Tesla P100, Ryzen 9 9950X3D, 64 GB DDR5);
+> not reviewed by a kernel/GPU engineer. Use at your own risk.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
