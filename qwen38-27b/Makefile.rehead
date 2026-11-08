@@ -1,0 +1,20 @@
+# Builds qwen38_rehead against this tree's ggml (build the repo first: see QWEN38_27B.md).
+# Usage: make -f qwen38-27b/Makefile.rehead [LLAMA=<repo root>] [BUILD=<cmake build dir>] [CXX=g++-14]
+LLAMA ?= .
+BUILD ?= $(LLAMA)/build
+CXX ?= g++
+BIN ?= $(BUILD)/bin/qwen38_rehead
+
+.PHONY: all clean
+
+all: $(BIN)
+
+$(BIN): $(LLAMA)/qwen38-27b/qwen38_rehead.cpp
+	$(CXX) -std=c++20 -O3 -pthread \
+		-I$(LLAMA)/ggml/include -I$(LLAMA)/vendor \
+		$< -o $@ \
+		-L$(BUILD)/bin -lggml-base \
+		-Wl,-rpath,$(BUILD)/bin
+
+clean:
+	rm -f $(BIN)

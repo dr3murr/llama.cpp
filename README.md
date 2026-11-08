@@ -1,3 +1,8 @@
+> **This is branch `qwen38-27b-p100` of a fork.** Qwen3.8-27B split across a Tesla P100 and an RTX 5080
+> (24/40 layers, 262k context, MTP, peer-to-peer streamed attention): see [QWEN38_27B.md](QWEN38_27B.md).
+> Written with AI coding agents and not reviewed by a kernel/GPU engineer; needs a patched NVIDIA driver setup.
+> The upstream llama.cpp README follows unchanged.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

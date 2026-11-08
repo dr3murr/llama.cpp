@@ -1,0 +1,95 @@
+{
+  "schema": "qwen38-hybrid-manifest-v1",
+  "model": {
+    "path": "/path/to/Qwen3.8-27B-UD-Q4_K_M.gguf",
+    "alias": "qwen3.8-27b-p100-5080-26x38-recovery"
+  },
+  "runtime": {
+    "cuda_visible_devices": "1,0",
+    "layer_split": {
+      "p100_base_layers": 26,
+      "rtx_base_layers": 38,
+      "p100_schedule_slots": 26,
+      "rtx_schedule_slots": 40
+    },
+    "context_size": 262144,
+    "batch_size": 2048,
+    "ubatch_size": 512,
+    "parallel": 1,
+    "pipeline_parallel": false,
+    "sampling": {
+      "profile": "qwen38-thinking-official",
+      "temperature": 1.0,
+      "top_k": 20,
+      "top_p": 0.95,
+      "min_p": 0.0,
+      "presence_penalty": 0.0,
+      "repetition_penalty": 1.0,
+      "status": "official Qwen3.8 thinking-mode defaults; the WebUI repetition guard offers this preset when it stops a generated-text cycle"
+    },
+    "direct_q8_mma": true,
+    "pascal_kq_hfma2": true,
+    "pascal_prefill_cublas_algorithm": 6,
+    "pascal_prefill_cublas_gdn_qkv_algorithm": 2,
+    "pascal_prefill_cublas_attn_q_algorithm": 3,
+    "pascal_prefill_cublas_gdn_z_algorithm": 6,
+    "pascal_prefill_resident_fp16": "both_plus_gdn_z",
+    "streamed_attention": {
+      "enabled": true,
+      "synchronization": "host",
+      "tile_tokens": 8192,
+      "minimum_kv_tokens": 16384,
+      "minimum_q_tokens": 128,
+      "maximum_q_tokens": 512,
+      "local_kv_heads": 0,
+      "source_pack": false,
+      "bounded_local": true,
+      "persistent_head_major_rtx": true,
+      "rtx_mma_shape": "32x2",
+      "status": "qualified memory-recovery path: all four KV heads use unpacked P100-to-RTX streaming because this Q6 26/38 layout does not have room for the optional 387 MiB ordinary P100 source-pack arena"
+    },
+    "speculative_batch_size": 64,
+    "speculative_ubatch_size": 32,
+    "speculator": {
+      "enabled": true,
+      "type": "draft-mtp",
+      "n_max": 1,
+      "p_min": 0.0,
+      "context_size": 4096,
+      "cache_type_k": "q8_kv256",
+      "cache_type_v": "q8_kv256",
+      "gpu_layers": "all",
+      "target_tensor_overrides": [
+        "blk\\.64\\..*=CUDA0"
+      ],
+      "status": "qualified 26/38 Q6 recovery profile: rolling width-one MTP remains on P100; the final all-remote decode-plus-vision gate left 335 MiB RTX and 256 MiB P100 free"
+    },
+    "vision": {
+      "enabled": true,
+      "model": "/path/to/mmproj-F16.gguf",
+      "device": "CUDA0",
+      "image_min_tokens": 1024,
+      "status": "co-resident on P100"
+    },
+    "kv_cache": {
+      "bits": 8,
+      "type_k": "q8_kv256",
+      "type_v": "q8_kv256",
+      "scale_type": "fp16",
+      "scale_group_elements": 256
+    }
+  },
+  "precision": {
+    "p100_weights": "source-exact Unsloth mixed Q/IQ formats",
+    "rtx_weights": "source mixed Q/IQ formats; NVFP4 rejected by the quality gate",
+    "gdn_recurrent_state": "fp32",
+    "p100_to_rtx_boundary": "fp16[5120]",
+    "token_mailbox": "uint32"
+  },
+  "p2p": {
+    "enabled": true,
+    "decode_protocol": "32-bit single-writer sequence doorbells",
+    "payload_owner": "consumer",
+    "native_peer_atomics": false
+  }
+}
