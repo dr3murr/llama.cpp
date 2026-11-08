@@ -26,6 +26,8 @@ merged here.
 - **Linux only.** `llama-server` and `llama-perplexity` on this branch call `setenv`/`unsetenv` without a Windows
   guard; a Windows build was not attempted.
 - **CUDA 12.9** (CUDA 13 cannot compile for the P100's `sm_60`), GCC 14, CMake, Ninja.
+- **A SageAttention checkout beside the repository**, at build time only: `ggml/src/ggml-cuda/qwen38-sage-attention.cu`
+  includes a header from `../SageAttention-reference` ([Build (Linux)](#build-linux)).
 - **Device order:** the manifests set `CUDA_VISIBLE_DEVICES=1,0`, so logical `CUDA0` is the P100 and `CUDA1` the
   RTX 5080 on the machine it was built for. Check your own `nvidia-smi` order.
 
@@ -79,6 +81,22 @@ The Q5_K head frees the ~169 MB the 24/40 layout needs. An NVFP4 variant was tri
 
 ## Build (Linux)
 
+`ggml/src/ggml-cuda/qwen38-sage-attention.cu` includes
+`../../../../SageAttention-reference/csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh`: a SageAttention checkout named
+`SageAttention-reference` in the directory that holds this repository, at upstream commit `d1a57a5` with the August
+changes in [`qwen38-27b/sageattention-d1a57a5-qwen38.patch`](qwen38-27b/sageattention-d1a57a5-qwen38.patch) (builds
+without PyTorch; adds the masks and strides Qwen3.8 needs; Apache-2.0). The Sage path is off at run time unless
+enabled, but without the checkout the build stops at that file. From the directory that holds the repository
+(`llama.cpp` is the clone's default name):
+
+```bash
+git clone https://github.com/thu-ml/SageAttention SageAttention-reference
+git -C SageAttention-reference checkout d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5
+git -C SageAttention-reference apply "$PWD/llama.cpp/qwen38-27b/sageattention-d1a57a5-qwen38.patch"
+```
+
+Then, in the repository:
+
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
@@ -89,7 +107,14 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build --target llama-server test-backend-ops test-recurrent-state-rollback -j
 ```
 
-These are the flags of the August build script. The published tree has not been rebuilt from a fresh clone.
+These are the flags of the August build script. On 2026-11-08 a fresh clone of this branch (`062433e`) was built
+with them in WSL2 (Ubuntu 24.04) using GCC 13.3 instead of 14 (CUDA 12.9 accepts both) and CUDA 12.9.86; NCCL was
+not installed, which CMake reports and skips. Without the SageAttention checkout the build stopped at
+`qwen38-sage-attention.cu` (`No such file or directory`); with it, the three targets above, the rest of the default
+target and `qwen38_rehead` compiled and linked. The compilers print warnings for this branch's own files (missing
+declarations, a switch without the `Q8_KV*` types in `ggml-cpu/ops.cpp`), none fatal. Nothing was run: no tests, no
+GPU. The CUDA 12 libraries have to be in the linker's search path (the CUDA packages add them to
+`/etc/ld.so.conf.d`), otherwise linking the programs fails on `libcudart.so.12` and `libcublas.so.12`.
 
 ## Run
 

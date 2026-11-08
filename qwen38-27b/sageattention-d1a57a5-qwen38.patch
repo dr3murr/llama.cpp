@@ -1,0 +1,304 @@
+Local changes to thu-ml/SageAttention (https://github.com/thu-ml/SageAttention, Apache-2.0) at commit
+d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5, made in August 2026 for the Qwen3.8 Sage attention backend: they let the
+headers build without PyTorch (SAGEATTN_STANDALONE) and add the masks and strides Qwen3.8 needs. The changed files
+remain under SageAttention's Apache-2.0 license.
+
+ggml/src/ggml-cuda/qwen38-sage-attention.cu includes ../../../../SageAttention-reference/csrc/qattn/
+qk_int_sv_f8_cuda_sm89.cuh, i.e. ../SageAttention-reference seen from the repository root, so the build needs that
+checkout beside the repository (QWEN38_27B.md, "Build (Linux)"). In a checkout of that commit:
+git apply sageattention-d1a57a5-qwen38.patch
+
+diff --git a/csrc/qattn/attn_utils.cuh b/csrc/qattn/attn_utils.cuh
+index 6f8b87c..16b3bdd 100644
+--- a/csrc/qattn/attn_utils.cuh
++++ b/csrc/qattn/attn_utils.cuh
+@@ -18,7 +18,9 @@
+ #include "../utils.cuh"
+ #include <cuda_fp16.h>
+ #include <cuda_pipeline_primitives.h>
++#ifndef SAGEATTN_STANDALONE
+ #include <torch/extension.h>
++#endif
+ 
+ #include "../cp_async.cuh"
+ #include "../mma.cuh"
+@@ -322,6 +324,91 @@ __device__ __forceinline__ void apply_causal_mask(const uint32_t &Q_idx_lane_bas
+   }
+ }
+ 
++// llama.cpp supplies an explicit contiguous F16 [query][KV] mask because its
++// padded/circular cache indices do not always match bottom-right causal
++// coordinates.  Qwen3.8 uses only 0 and -INF values here; preserve the fast
++// SageAttention math while honoring every physical cache cell exactly.
++template <uint32_t num_tiles_q, uint32_t num_tiles_k, typename DTypeQKAccum>
++__device__ __forceinline__ void apply_qwen38_ggml_mask(
++    const uint32_t &Q_idx_lane_base,
++    const uint32_t &K_idx_lane_base,
++    DTypeQKAccum RS[][num_tiles_k][8],
++    const half *mask,
++    const uint32_t mask_stride_q,
++    const uint32_t qo_len,
++    const uint32_t kv_len)
++{
++#pragma unroll
++  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
++  {
++#pragma unroll
++    for (uint32_t fk = 0; fk < num_tiles_k; fk++)
++    {
++#pragma unroll
++      for (uint32_t k = 0; k < 8; k++)
++      {
++        const uint32_t q_idx = Q_idx_lane_base + fq * 16 + 8 * ((k % 4) / 2);
++        const uint32_t kv_idx = K_idx_lane_base + fk * 16 + 8 * (k / 4) + k % 2;
++        bool masked = q_idx >= qo_len || kv_idx >= kv_len;
++        if (!masked)
++        {
++          const float mask_value = __half2float(mask[q_idx * mask_stride_q + kv_idx]);
++          masked = !isfinite(mask_value) || mask_value < -10000.0f;
++        }
++        if constexpr (std::is_same<DTypeQKAccum, float>::value)
++        {
++          RS[fq][fk][k] = masked ? -5000000.0f : RS[fq][fk][k];
++        }
++        else if constexpr (std::is_same<DTypeQKAccum, half>::value)
++        {
++          RS[fq][fk][k] = masked ? __float2half_rn(-50000.0f) : RS[fq][fk][k];
++        }
++      }
++    }
++  }
++}
++
++// A single-sequence llama.cpp causal mask is a finite prefix followed by an
++// infinite suffix.  Its prefix length carries all the information Sage needs,
++// including padding at the end of the physical cache.  Applying these compact
++// limits only to the one or two boundary K tiles preserves Sage's native
++// causal tile skipping instead of evaluating every future tile and masking it
++// afterwards.
++template <uint32_t num_tiles_q, uint32_t num_tiles_k, typename DTypeQKAccum>
++__device__ __forceinline__ void apply_qwen38_ggml_limits(
++    const uint32_t &Q_idx_lane_base,
++    const uint32_t &K_idx_lane_base,
++    DTypeQKAccum RS[][num_tiles_k][8],
++    const int *limits,
++    const uint32_t qo_len,
++    const uint32_t kv_len)
++{
++#pragma unroll
++  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
++  {
++#pragma unroll
++    for (uint32_t fk = 0; fk < num_tiles_k; fk++)
++    {
++#pragma unroll
++      for (uint32_t k = 0; k < 8; k++)
++      {
++        const uint32_t q_idx = Q_idx_lane_base + fq * 16 + 8 * ((k % 4) / 2);
++        const uint32_t kv_idx = K_idx_lane_base + fk * 16 + 8 * (k / 4) + k % 2;
++        const bool masked = q_idx >= qo_len || kv_idx >= kv_len ||
++          (q_idx < qo_len && kv_idx >= uint32_t(limits[q_idx]));
++        if constexpr (std::is_same<DTypeQKAccum, float>::value)
++        {
++          RS[fq][fk][k] = masked ? -5000000.0f : RS[fq][fk][k];
++        }
++        else if constexpr (std::is_same<DTypeQKAccum, half>::value)
++        {
++          RS[fq][fk][k] = masked ? __float2half_rn(-50000.0f) : RS[fq][fk][k];
++        }
++      }
++    }
++  }
++}
++
+ template <uint32_t num_tiles_q, uint32_t num_tiles_k, typename DTypeQKAccum>
+ __device__ __forceinline__ void apply_out_of_bound_mask(const uint32_t &K_idx_lane_base, DTypeQKAccum RS[][num_tiles_k][8], const uint32_t &kv_len)
+ {
+@@ -989,4 +1076,4 @@ __device__ __forceinline__ void compute_fp8_sv_inst_buf_fp16_accu(const smem_t<s
+ //       RO[fq][fv][7] += RO_inst_buf[fq][fv][7];
+ //     }
+ //   }
+-}
+\ No newline at end of file
++}
+diff --git a/csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh b/csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh
+index f39719f..8b2bcf3 100644
+--- a/csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh
++++ b/csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh
+@@ -17,13 +17,17 @@
+ #include "../utils.cuh"
+ #include <cuda_fp16.h>
+ #include <cuda_pipeline_primitives.h>
++#ifndef SAGEATTN_STANDALONE
+ #include <torch/extension.h>
++#endif
+ 
+ #include "../cp_async.cuh"
+ #include "../mma.cuh"
+ #include "../permuted_smem.cuh"
+ #include "../math.cuh"
++#ifndef SAGEATTN_STANDALONE
+ #include "../dispatch_utils.h"
++#endif
+ 
+ #include "attn_utils.cuh"
+ 
+@@ -42,15 +46,19 @@
+ #define MMA_SV_K 32
+ 
+ template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN, QuantGranularity K_GRAN,
+-        typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_scale=false, bool fuse_v_mean=false, bool use_pv_fp16_accu=false>
++        typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_scale=false, bool fuse_v_mean=false, bool use_pv_fp16_accu=false, bool qwen38_use_limits=false>
+ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V, DTypeOut *__restrict__ O, float *__restrict__ Lse,
+                       float *__restrict__ Q_scale, float *__restrict__ K_scale, float *__restrict__ V_scale, float *__restrict__ V_mean,
+-                      const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
++                      const uint32_t qo_len, const uint32_t kv_len_physical, const uint32_t num_kv_groups,
+                       const uint32_t stride_bz_q, const uint32_t stride_seq_q, const uint32_t stride_h_q, 
+                       const uint32_t stride_bz_k, const uint32_t stride_seq_k, const uint32_t stride_h_k,
+                       const uint32_t stride_bz_v, const uint32_t stride_h_v, const uint32_t stride_d_v,
+                       const uint32_t stride_bz_o, const uint32_t stride_seq_o, const uint32_t stride_h_o,
+-                      float sm_scale)
++                      float sm_scale,
++                      const half *qwen38_ggml_mask = nullptr,
++                      const uint32_t qwen38_ggml_mask_stride_q = 0,
++                      const int *qwen38_ggml_limits = nullptr,
++                      const uint32_t qwen38_k_scale_head_stride = 0)
+ {
+   // compile time check
+   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4, "DTypeQK must be int8 or int4");
+@@ -62,6 +70,10 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
+   static_assert(CTA_K % 64 == 0);
+   static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
+ 
++  const uint32_t kv_len = qwen38_use_limits
++      ? min(kv_len_physical, uint32_t(max(0, qwen38_ggml_limits[qo_len - 1])))
++      : kv_len_physical;
++
+   constexpr uint32_t num_warps_q = CTA_Q / WARP_Q;
+   constexpr uint32_t num_warps_k = CTA_K / WARP_K;
+   constexpr uint32_t num_warps = num_warps_q * num_warps_k;
+@@ -116,12 +128,18 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
+   if constexpr (K_GRAN == QuantGranularity::kPerBlock)
+   {
+     const uint32_t num_block_k = div_ceil(kv_len, CTA_K);
+-    k_scale_idx = batch_id * (num_qo_heads / num_kv_groups) * num_block_k + (head_id / num_kv_groups) * num_block_k;
++    const uint32_t scale_head_stride = qwen38_k_scale_head_stride != 0 ? qwen38_k_scale_head_stride : num_block_k;
++    k_scale_idx = batch_id * (num_qo_heads / num_kv_groups) * scale_head_stride + (head_id / num_kv_groups) * scale_head_stride;
+   }
+   else if constexpr (K_GRAN == QuantGranularity::kPerWarp)
+   {
+     const uint32_t num_warp_block_k = div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K);
+-    k_scale_idx = batch_id * (num_qo_heads / num_kv_groups) * num_warp_block_k + (head_id / num_kv_groups) * num_warp_block_k + get_warp_idx_k<num_warps_q, num_warps_k>();
++    const uint32_t scale_head_stride = qwen38_k_scale_head_stride != 0
++        ? qwen38_k_scale_head_stride
++        : num_warp_block_k;
++    k_scale_idx = batch_id * (num_qo_heads / num_kv_groups) * scale_head_stride +
++        (head_id / num_kv_groups) * scale_head_stride +
++        get_warp_idx_k<num_warps_q, num_warps_k>();
+   }
+   else if constexpr (K_GRAN == QuantGranularity::kPerThread)
+   {
+@@ -212,7 +230,9 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
+   uint32_t V_smem_offset_mma = smem_V.get_permuted_offset(lane_id % 8 + (lane_id / 16) * 8, get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K / PACK_SIZE_V + (lane_id / 8) % 2);
+ 
+   // for causal masking
+-  uint32_t Q_idx_lane_base = bx * CTA_Q + get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / 4;
++  const uint32_t q_position_offset = kv_len >= qo_len ? kv_len - qo_len : 0;
++  uint32_t Q_idx_lane_base = q_position_offset + bx * CTA_Q + get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / 4;
++  const uint32_t Q_idx_lane_base_local = bx * CTA_Q + get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / 4;
+   uint32_t K_idx_lane_base = get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K + 2 * (lane_id % 4);
+ 
+   // for loading
+@@ -220,8 +240,8 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
+   uint32_t K_load_idx_lane_base = CTA_K / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK;
+ 
+   const uint32_t num_iterations = div_ceil(
+-      mask_mode == MaskMode::kCausal
+-          ? min(kv_len, (bx + 1) * CTA_Q)
++      qwen38_ggml_mask == nullptr && mask_mode == MaskMode::kCausal
++          ? min(kv_len, q_position_offset + (bx + 1) * CTA_Q)
+           : kv_len,
+       CTA_K);
+ 
+@@ -242,6 +262,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
+       smem_Q.ldmatrix_m8n8x4(Q_smem_offset_mma, RQ[fq]);
+       Q_smem_offset_mma = smem_Q.advance_offset_by_row<16>(Q_smem_offset_mma);
+     }
++
+   }
+ 
+   // load K with predicate
+@@ -300,6 +321,13 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
+       }
+     }
+ 
++    if (qwen38_ggml_mask != nullptr)
++    {
++      apply_qwen38_ggml_mask<num_tiles_q, num_tiles_k>(
++        Q_idx_lane_base_local, K_idx_lane_base, RS_f32,
++        qwen38_ggml_mask, qwen38_ggml_mask_stride_q, qo_len, kv_len);
++    }
++
+     K_idx_lane_base += CTA_K;
+ 
+     if constexpr (std::is_same<DTypeSVAccum, float>::value)
+@@ -403,7 +431,13 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
+       }
+     }
+ 
+-    if constexpr (mask_mode == MaskMode::kCausal)
++    if (qwen38_ggml_mask != nullptr)
++    {
++      apply_qwen38_ggml_mask<num_tiles_q, num_tiles_k>(
++        Q_idx_lane_base_local, K_idx_lane_base, RS_f32,
++        qwen38_ggml_mask, qwen38_ggml_mask_stride_q, qo_len, kv_len);
++    }
++    else if constexpr (mask_mode == MaskMode::kCausal)
+     {
+       apply_causal_mask<num_tiles_q, num_tiles_k>(Q_idx_lane_base, K_idx_lane_base, RS_f32);
+     }
+@@ -510,7 +544,13 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
+       }
+     }
+ 
+-    if constexpr (mask_mode == MaskMode::kCausal)
++    if (qwen38_ggml_mask != nullptr)
++    {
++      apply_qwen38_ggml_mask<num_tiles_q, num_tiles_k>(
++        Q_idx_lane_base_local, K_idx_lane_base, RS_f32,
++        qwen38_ggml_mask, qwen38_ggml_mask_stride_q, qo_len, kv_len);
++    }
++    else if constexpr (mask_mode == MaskMode::kCausal)
+     {
+       apply_causal_mask<num_tiles_q, num_tiles_k>(Q_idx_lane_base, K_idx_lane_base, RS_f32);
+     }
+@@ -702,9 +742,3 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
+     }
+   }
+ }
+-
+-
+-
+-
+-
+-
+diff --git a/csrc/utils.cuh b/csrc/utils.cuh
+index ca83d2c..3e5d730 100644
+--- a/csrc/utils.cuh
++++ b/csrc/utils.cuh
+@@ -15,6 +15,7 @@
+  */
+ 
+ #pragma once
++#ifndef SAGEATTN_STANDALONE
+ #include <torch/extension.h>
+ 
+ #define CHECK_CUDA(x) \
+@@ -35,4 +36,5 @@
+   TORCH_CHECK(x.is_contiguous(), "Tensor " #x " must be contiguous")
+ #define CHECK_LASTDIM_CONTIGUOUS(x) \
+   TORCH_CHECK(x.stride(-1) == 1,    \
+-              "Tensor " #x " must be contiguous at the last dimension")
+\ No newline at end of file
++              "Tensor " #x " must be contiguous at the last dimension")
++#endif
