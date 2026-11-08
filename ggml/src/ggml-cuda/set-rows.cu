@@ -1,5 +1,51 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include "qwen38-sage-attention.cuh"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
+
+namespace {
+
+std::mutex qwen38_sage_mode_mutex;
+std::unordered_map<void *, bool> qwen38_sage_mode;
+
+int qwen38_sage_prefill_min_q() {
+    const char * value = getenv("QWEN38_CUDA_SAGE_ATTN_MIN_Q");
+    if (!value) {
+        return 65;
+    }
+    return std::max(1, atoi(value));
+}
+
+int qwen38_sage_prefill_min_kv() {
+    const char * value = getenv("QWEN38_CUDA_SAGE_ATTN_MIN_KV");
+    if (!value) {
+        return 65536;
+    }
+    return std::max(0, atoi(value));
+}
+
+int qwen38_sage_layer_min() {
+    const char * value = getenv("QWEN38_CUDA_SAGE_ATTN_LAYER_MIN");
+    return value ? std::max(0, atoi(value)) : 0;
+}
+
+int qwen38_sage_layer_max() {
+    const char * value = getenv("QWEN38_CUDA_SAGE_ATTN_LAYER_MAX");
+    return value ? std::max(0, atoi(value)) : 63;
+}
+
+} // namespace
+
+extern "C" bool qwen38_cuda_sage_cache_is_active(const void * storage) {
+    std::lock_guard<std::mutex> lock(qwen38_sage_mode_mutex);
+    const auto it = qwen38_sage_mode.find(const_cast<void *>(storage));
+    return it != qwen38_sage_mode.end() && it->second;
+}
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -307,6 +353,36 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_Q8_KV64) {
+        set_rows_cuda_quant<idx_t, block_q8_kv64, QK8_KV64, quantize_f32_q8_kv_block<block_q8_kv64, QK8_KV64>>(
+            src0_d, src1_d, (block_q8_kv64 *) dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
+    } else if (dst->type == GGML_TYPE_Q8_KV128) {
+        set_rows_cuda_quant<idx_t, block_q8_kv128, QK8_KV128, quantize_f32_q8_kv_block<block_q8_kv128, QK8_KV128>>(
+            src0_d, src1_d, (block_q8_kv128 *) dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
+    } else if (dst->type == GGML_TYPE_Q8_KV256) {
+        set_rows_cuda_quant<idx_t, block_q8_kv256, QK8_KV256, quantize_f32_q8_kv_block<block_q8_kv256, QK8_KV256>>(
+            src0_d, src1_d, (block_q8_kv256 *) dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
     } else if (dst->type == GGML_TYPE_IQ4_NL) {
         set_rows_cuda_quant<idx_t, block_iq4_nl, QK4_NL, quantize_f32_iq4_nl_block>(
             src0_d, src1_d, (block_iq4_nl*)dst->data,
@@ -376,6 +452,81 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
 void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    ggml_qwen38_sage_set_rows_params sage_params = {};
+    static_assert(sizeof(sage_params) <= GGML_MAX_OP_PARAMS, "Sage SET_ROWS parameters exceed op storage");
+    memcpy(&sage_params, dst->op_params, sizeof(sage_params));
+    if (sage_params.magic == GGML_QWEN38_SAGE_SET_ROWS_MAGIC) {
+        GGML_ASSERT(src0->type == GGML_TYPE_F32);
+        GGML_ASSERT(src1->type == GGML_TYPE_I64);
+        GGML_ASSERT(dst->type == GGML_TYPE_Q8_KV256);
+        GGML_ASSERT(src0->ne[0] == 256);
+        GGML_ASSERT(ggml_nrows(src0) == src1->ne[0]);
+        GGML_ASSERT(sage_params.capacity > 0 && sage_params.capacity % 64 == 0);
+
+        GGML_ASSERT(sage_params.kind == GGML_QWEN38_SAGE_CACHE_K ||
+            sage_params.kind == GGML_QWEN38_SAGE_CACHE_V);
+        GGML_ASSERT(ggml_nrows(src0) % 4 == 0);
+        const int64_t q_tokens = ggml_nrows(src0)/4;
+        // The attention wrapper left-pads partial query CTAs, so substantial
+        // non-aligned ubatches remain in the resident Sage representation.
+        // Tiny decode/tail batches still transition once to the Q8 decode path.
+        const bool want_sage = q_tokens >= qwen38_sage_prefill_min_q() &&
+            int64_t(sage_params.reserved) >= qwen38_sage_prefill_min_kv() &&
+            int(sage_params.layer) >= qwen38_sage_layer_min() &&
+            int(sage_params.layer) <= qwen38_sage_layer_max();
+
+        cudaError_t error = cudaSuccess;
+        {
+            std::lock_guard<std::mutex> lock(qwen38_sage_mode_mutex);
+            const bool is_sage = qwen38_sage_mode[dst->data];
+            if (is_sage != want_sage) {
+                error = qwen38_cuda_sage_convert_cache(
+                    dst->data,
+                    sage_params.capacity,
+                    std::max<int64_t>(0, int64_t(sage_params.reserved) - q_tokens),
+                    sage_params.kind,
+                    want_sage,
+                    ctx.stream());
+                if (error == cudaSuccess) {
+                    qwen38_sage_mode[dst->data] = want_sage;
+                    const char * log_transitions = getenv("QWEN38_CUDA_SAGE_ATTN_LOG");
+                    if (log_transitions && atoi(log_transitions) != 0) {
+                        fprintf(stderr,
+                            "qwen38 Sage cache transition: storage=%p layer=%u kind=%u q=%lld kv=%u mode=%s\n",
+                            dst->data, sage_params.layer, sage_params.kind, (long long) q_tokens, sage_params.reserved,
+                            want_sage ? "sage" : "q8");
+                    }
+                }
+            }
+        }
+        CUDA_CHECK(error);
+
+        if (want_sage) {
+            if (sage_params.kind == GGML_QWEN38_SAGE_CACHE_K) {
+                error = qwen38_cuda_sage_append_k(
+                    static_cast<const float *>(src0->data),
+                    static_cast<const int64_t *>(src1->data),
+                    dst->data,
+                    ggml_nrows(src0),
+                    sage_params.capacity,
+                    src0->nb[1],
+                    ctx.stream());
+            } else {
+                error = qwen38_cuda_sage_append_v(
+                    static_cast<const float *>(src0->data),
+                    static_cast<const int64_t *>(src1->data),
+                    dst->data,
+                    ggml_nrows(src0),
+                    sage_params.capacity,
+                    std::max<int64_t>(0, int64_t(sage_params.reserved) - q_tokens),
+                    src0->nb[1],
+                    ctx.stream());
+            }
+            CUDA_CHECK(error);
+            return;
+        }
+    }
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);

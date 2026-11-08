@@ -432,6 +432,16 @@ llama_context::llama_context(
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
 
+        // The private heterogeneous Qwen3.8 runtime uses one decode sequence.
+        // Its manifest may trade scheduler pipeline copies for VRAM headroom.
+        // Leave upstream behavior unchanged when the variable is absent.
+        if (const char * value = getenv("QWEN38_PIPELINE_PARALLEL")) {
+            if (atoi(value) == 0) {
+                pipeline_parallel = false;
+                LLAMA_LOG_INFO("%s: pipeline parallelism disabled by hybrid manifest\n", __func__);
+            }
+        }
+
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
             for (auto & backend : backends) {
@@ -559,7 +569,24 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     if (cparams.auto_fgdn) {
         LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
         resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
-        resolve(llm_fused_op_gdn_ch_probe, cparams.fused_gdn_ch);
+
+        const char * LLAMA_GDN_CHUNK_GRAPH = getenv("LLAMA_GDN_CHUNK_GRAPH");
+        const bool force_chunk_graph = LLAMA_GDN_CHUNK_GRAPH && atoi(LLAMA_GDN_CHUNK_GRAPH) != 0;
+        const char * LLAMA_GDN_CHUNK_CUDA = getenv("LLAMA_GDN_CHUNK_CUDA");
+        const char * LLAMA_GDN_CHUNK_CUDA_LAYER_MIN = getenv("LLAMA_GDN_CHUNK_CUDA_LAYER_MIN");
+        const bool force_cuda_chunk = LLAMA_GDN_CHUNK_CUDA && atoi(LLAMA_GDN_CHUNK_CUDA) != 0 &&
+                LLAMA_GDN_CHUNK_CUDA_LAYER_MIN && LLAMA_GDN_CHUNK_CUDA_LAYER_MIN[0] != '\0';
+        if (force_chunk_graph || force_cuda_chunk) {
+            cparams.fused_gdn_ch = false;
+            if (force_cuda_chunk) {
+                LLAMA_LOG_WARN("%s: using the experimental CUDA Gated Delta Net chunk path from layer %d\n",
+                        func, atoi(LLAMA_GDN_CHUNK_CUDA_LAYER_MIN));
+            } else {
+                LLAMA_LOG_WARN("%s: using the generic FP32 Gated Delta Net chunk graph for prompt processing\n", func);
+            }
+        } else {
+            resolve(llm_fused_op_gdn_ch_probe, cparams.fused_gdn_ch);
+        }
         cparams.auto_fgdn = false;
     }
 
@@ -1150,6 +1177,14 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
     }
 }
 
+void llama_context::set_eval_callback(
+        ggml_backend_sched_eval_callback callback,
+        void * user_data) {
+    cparams.cb_eval = callback;
+    cparams.cb_eval_user_data = user_data;
+    ggml_backend_sched_set_eval_callback(sched.get(), callback, user_data);
+}
+
 void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1336,7 +1371,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    bool qwen38_graph_matches_layer = true;
+    const char * qwen38_reuse_layer_major_env = getenv("QWEN38_PREFILL_RTX_LAYER_MAJOR_STAGE_CACHE");
+    const char * qwen38_reuse_layer_end_env = getenv("QWEN38_DIAGNOSTIC_LAYER_END");
+    if (qwen38_reuse_layer_major_env && atoi(qwen38_reuse_layer_major_env) != 0 &&
+            qwen38_reuse_layer_end_env && ggml_graph_n_nodes(gf) > 0) {
+        const std::string expected = "diagnostic_layer_out-" + std::to_string(atoi(qwen38_reuse_layer_end_env));
+        qwen38_graph_matches_layer = strcmp(ggml_graph_node(gf, -1)->name, expected.c_str()) == 0;
+    }
+
+    if (!graph_reuse_disable && qwen38_graph_matches_layer && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1365,11 +1409,81 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // The layer-major diagnostic executor deliberately builds exactly one
+        // transformer layer at a time.  Make the final placement decision here,
+        // after every anonymous inner op has been added to the graph and before
+        // the scheduler inserts cross-backend copies.  Build-time callbacks only
+        // see the named outer tensors and are therefore insufficient for QKV,
+        // alpha/beta and convolution internals.
+        const char * qwen38_layer_major_env = getenv("QWEN38_PREFILL_RTX_LAYER_MAJOR_STAGE_CACHE");
+        const char * qwen38_layer_start_env = getenv("QWEN38_DIAGNOSTIC_LAYER_START");
+        const char * qwen38_layer_end_env = getenv("QWEN38_DIAGNOSTIC_LAYER_END");
+        const char * qwen38_boundary_env = getenv("QWEN38_PREFILL_RTX_GRAPH_LAYERS");
+        const char * qwen38_min_tokens_env = getenv("QWEN38_PREFILL_RTX_GRAPH_MIN_TOKENS");
+        const bool qwen38_layer_major = qwen38_layer_major_env && atoi(qwen38_layer_major_env) != 0;
+        const int qwen38_layer_start = qwen38_layer_start_env ? atoi(qwen38_layer_start_env) : -1;
+        const int qwen38_layer_end = qwen38_layer_end_env ? atoi(qwen38_layer_end_env) : -1;
+        const int qwen38_boundary = qwen38_boundary_env ? atoi(qwen38_boundary_env) : 0;
+        const uint32_t qwen38_min_tokens = qwen38_min_tokens_env ?
+            (uint32_t) atoi(qwen38_min_tokens_env) : std::numeric_limits<uint32_t>::max();
+        if (qwen38_layer_major && qwen38_layer_start >= 0 &&
+                qwen38_layer_end == qwen38_layer_start + 1 &&
+                qwen38_layer_start < qwen38_boundary &&
+                qwen38_boundary < (int) model.hparams.n_layer() &&
+                ubatch.n_tokens >= qwen38_min_tokens) {
+            const auto dev_prefill = model.dev_layer(qwen38_boundary);
+            ggml_backend_t backend_prefill = nullptr;
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev_prefill) {
+                    backend_prefill = backend.get();
+                    break;
+                }
+            }
+            GGML_ASSERT(backend_prefill);
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                const bool token_embedding = node->op == GGML_OP_GET_ROWS && node->src[0] &&
+                    strcmp(node->src[0]->name, "token_embd.weight") == 0;
+                if (!token_embedding) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), node, backend_prefill);
+                }
+            }
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+    }
+
+    const char * qwen38_dry_run_env = getenv("QWEN38_PREFILL_RTX_DRY_RUN");
+    if (qwen38_dry_run_env && atoi(qwen38_dry_run_env) != 0) {
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+            fprintf(stderr,
+                    "qwen38_layer_major_final: node=%d name='%s' op=%s backend=%s buffer=%s",
+                    i,
+                    node->name,
+                    ggml_op_name(node->op),
+                    backend ? ggml_backend_name(backend) : "NULL",
+                    node->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(node->buffer)) : "NULL");
+            for (int j = 0; j < GGML_MAX_SRC && node->src[j]; ++j) {
+                ggml_tensor * src = node->src[j];
+                ggml_backend_t src_backend = ggml_backend_sched_get_tensor_backend(sched.get(), src);
+                fprintf(stderr,
+                        " src%d='%s':%s:%s",
+                        j,
+                        src->name,
+                        src_backend ? ggml_backend_name(src_backend) : "NULL",
+                        src->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(src->buffer)) : "NULL");
+            }
+            fputc('\n', stderr);
+        }
+        LLAMA_LOG_WARN("%s: QWEN38 prefill dry run built and allocated the graph without executing CUDA work\n", __func__);
+        ret = GGML_STATUS_SUCCESS;
+        return res;
     }
 
     // set the input data for the input tensors
@@ -2186,6 +2300,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     this->n_outputs = 0;
 
+    if (n_outputs_max > cparams.n_outputs_max) {
+        LLAMA_LOG_ERROR("%s: requested n_outputs_max=%" PRId64 " exceeds reserved=%u (n_outputs=%d, n_seq_max=%u)\n",
+                __func__, n_outputs_max, cparams.n_outputs_max, n_outputs, n_seq_max());
+    }
     GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max);
 
     return n_outputs_max;
@@ -2507,6 +2625,40 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        const char * qwen38_prefill_rtx_layers_env = getenv("QWEN38_PREFILL_RTX_GRAPH_LAYERS");
+        const char * qwen38_prefill_rtx_tokens_env = getenv("QWEN38_PREFILL_RTX_GRAPH_MIN_TOKENS");
+        const char * qwen38_layer_major_cache_env = getenv("QWEN38_PREFILL_RTX_LAYER_MAJOR_STAGE_CACHE");
+        const int qwen38_prefill_rtx_layers = qwen38_prefill_rtx_layers_env ? atoi(qwen38_prefill_rtx_layers_env) : 0;
+        const uint32_t qwen38_prefill_rtx_tokens = qwen38_prefill_rtx_tokens_env ? (uint32_t) atoi(qwen38_prefill_rtx_tokens_env) : std::numeric_limits<uint32_t>::max();
+        const bool qwen38_layer_major_cache = qwen38_layer_major_cache_env && atoi(qwen38_layer_major_cache_env) != 0;
+        if (il >= 0 && il < qwen38_prefill_rtx_layers && ubatch.n_tokens >= qwen38_prefill_rtx_tokens &&
+                qwen38_prefill_rtx_layers < (int) model.hparams.n_layer() &&
+                (!qwen38_layer_major_cache || cur->op != GGML_OP_CPY)) {
+            const auto dev_prefill = model.dev_layer(qwen38_prefill_rtx_layers);
+            // The staging cast is deliberately a cross-device copy: its
+            // source is a P100-resident model tensor while its destination
+            // must be allocated on the RTX.  supports_op() rejects that
+            // partially allocated form even though the CUDA backend handles
+            // the peer copy once the scheduler assigns the destination.
+            const bool is_prefill_weight_stage = strcmp(name, "prefill_weight_stage") == 0;
+            const bool is_layer_major_compute = qwen38_layer_major_cache &&
+                (cur->op == GGML_OP_MUL_MAT || cur->op == GGML_OP_GATED_DELTA_NET);
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev_prefill &&
+                        (is_prefill_weight_stage || is_layer_major_compute || ggml_backend_supports_op(backend.get(), cur))) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                    const char * debug_env = getenv("QWEN38_PREFILL_RTX_DRY_RUN");
+                    if (debug_env && atoi(debug_env) != 0) {
+                        fprintf(stderr,
+                            "qwen38_layer_major_assignment: layer=%d name='%s' op=%s device=%s unconditional=%d\n",
+                            il, name, ggml_op_name(cur->op), ggml_backend_dev_name(dev_prefill),
+                            (is_prefill_weight_stage || is_layer_major_compute) ? 1 : 0);
+                    }
+                    break;
+                }
+            }
         }
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
@@ -3714,6 +3866,13 @@ int32_t llama_n_threads_batch(llama_context * ctx) {
 
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
     ctx->set_abort_callback(abort_callback, abort_callback_data);
+}
+
+void llama_set_eval_callback(
+        llama_context * ctx,
+        ggml_backend_sched_eval_callback callback,
+        void * user_data) {
+    ctx->set_eval_callback(callback, user_data);
 }
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {

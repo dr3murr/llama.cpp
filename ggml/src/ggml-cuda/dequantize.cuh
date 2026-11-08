@@ -119,6 +119,27 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+template<typename block_t>
+static __device__ __forceinline__ void dequantize_q8_kv(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_t * x = (const block_t *) vx;
+    const float d = x[ib].d;
+
+    v.x = d*x[ib].qs[iqs + 0];
+    v.y = d*x[ib].qs[iqs + 1];
+}
+
+static __device__ __forceinline__ void dequantize_q8_kv64(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    dequantize_q8_kv<block_q8_kv64>(vx, ib, iqs, v);
+}
+
+static __device__ __forceinline__ void dequantize_q8_kv128(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    dequantize_q8_kv<block_q8_kv128>(vx, ib, iqs, v);
+}
+
+static __device__ __forceinline__ void dequantize_q8_kv256(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    dequantize_q8_kv<block_q8_kv256>(vx, ib, iqs, v);
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the

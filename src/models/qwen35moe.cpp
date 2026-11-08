@@ -462,7 +462,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     // if head keys and value keys are different, repeat to force tensors into matching shapes
     // note: need explicit repeat only if we are not using the fused GDN.
-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+    const bool use_fused_gdn = n_seq_tokens == 1 ? cparams.fused_gdn_ar : !use_delta_net_chunk_split(il);
+    if (num_k_heads != num_v_heads && !use_fused_gdn) {
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
         q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
         k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);

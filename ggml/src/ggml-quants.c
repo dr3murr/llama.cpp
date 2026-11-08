@@ -298,6 +298,40 @@ void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_REST
     }
 }
 
+static void quantize_row_q8_kv_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k, int qk, size_t block_size) {
+    assert(k % qk == 0);
+    char * y = (char *) vy;
+
+    for (int64_t i = 0; i < k/qk; ++i) {
+        float amax = 0.0f;
+        for (int j = 0; j < qk; ++j) {
+            amax = MAX(amax, fabsf(x[i*qk + j]));
+        }
+
+        const float d  = amax / 127.0f;
+        const float id = d ? 1.0f/d : 0.0f;
+        ggml_half * yd = (ggml_half *) (y + i*block_size);
+        int8_t * yq = (int8_t *) (yd + 1);
+        *yd = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < qk; ++j) {
+            yq[j] = roundf(x[i*qk + j]*id);
+        }
+    }
+}
+
+void quantize_row_q8_kv64_ref(const float * GGML_RESTRICT x, block_q8_kv64 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q8_kv_ref(x, y, k, QK8_KV64, sizeof(*y));
+}
+
+void quantize_row_q8_kv128_ref(const float * GGML_RESTRICT x, block_q8_kv128 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q8_kv_ref(x, y, k, QK8_KV128, sizeof(*y));
+}
+
+void quantize_row_q8_kv256_ref(const float * GGML_RESTRICT x, block_q8_kv256 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q8_kv_ref(x, y, k, QK8_KV256, sizeof(*y));
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_RESTRICT y, int64_t k) {
     assert(QK8_1 == 32);
@@ -564,6 +598,32 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
             y[i*qk + j] = x[i].qs[j]*d;
         }
     }
+}
+
+static void dequantize_row_q8_kv(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k, int qk, size_t block_size) {
+    assert(k % qk == 0);
+    const char * x = (const char *) vx;
+
+    for (int64_t i = 0; i < k/qk; ++i) {
+        const ggml_half * xd = (const ggml_half *) (x + i*block_size);
+        const int8_t * xq = (const int8_t *) (xd + 1);
+        const float d = GGML_FP16_TO_FP32(*xd);
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = xq[j]*d;
+        }
+    }
+}
+
+void dequantize_row_q8_kv64(const block_q8_kv64 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_q8_kv(x, y, k, QK8_KV64, sizeof(*x));
+}
+
+void dequantize_row_q8_kv128(const block_q8_kv128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_q8_kv(x, y, k, QK8_KV128, sizeof(*x));
+}
+
+void dequantize_row_q8_kv256(const block_q8_kv256 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_q8_kv(x, y, k, QK8_KV256, sizeof(*x));
 }
 
 void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
@@ -5556,6 +5616,18 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q8_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q8_0, data, nb);
+            } break;
+        case GGML_TYPE_Q8_KV64:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q8_kv64, data, nb);
+            } break;
+        case GGML_TYPE_Q8_KV128:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q8_kv128, data, nb);
+            } break;
+        case GGML_TYPE_Q8_KV256:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q8_kv256, data, nb);
             } break;
         case GGML_TYPE_MXFP4:
             {

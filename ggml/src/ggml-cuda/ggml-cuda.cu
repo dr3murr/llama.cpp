@@ -68,6 +68,8 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/qwen38-pascal-ffn.cuh"
+#include "ggml-cuda/qwen38-pascal-gdn.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -79,6 +81,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -1406,6 +1409,66 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+static bool qwen38_cuda_pascal_prefill_cublas_experiment_selected(const ggml_tensor * src0) {
+    // Diagnostic-only projection-class screen. This variable is intentionally
+    // absent from the hybrid manifest parser; the qualified GDN-QKV policy
+    // has a separate integer algorithm setting.
+    // Keep the values explicit: an accidental broad match can transiently
+    // expand much more quantized weight data than the P100 pool can hold.
+    const char * experiment = std::getenv("QWEN38_CUDA_PASCAL_PREFILL_CUBLAS_EXPERIMENT");
+    if (!experiment) {
+        return false;
+    }
+    if (std::strcmp(experiment, "gdn_qkv") == 0) {
+        return std::strstr(src0->name, ".attn_qkv.weight");
+    }
+    if (std::strcmp(experiment, "gdn_z") == 0) {
+        return std::strstr(src0->name, ".attn_gate.weight");
+    }
+    if (std::strcmp(experiment, "gdn_out") == 0) {
+        return std::strstr(src0->name, ".ssm_out.weight");
+    }
+    if (std::strcmp(experiment, "attn_q") == 0) {
+        return std::strstr(src0->name, ".attn_q.weight");
+    }
+    if (std::strcmp(experiment, "attn_kv") == 0) {
+        return std::strstr(src0->name, ".attn_k.weight") ||
+               std::strstr(src0->name, ".attn_v.weight");
+    }
+    if (std::strcmp(experiment, "attn_out") == 0) {
+        return std::strstr(src0->name, ".attn_output.weight");
+    }
+    return false;
+}
+
+static const char * qwen38_cuda_pascal_prefill_cublas_projection_algorithm(const ggml_tensor * src0) {
+    if (std::strstr(src0->name, ".attn_qkv.weight")) {
+        return std::getenv("QWEN38_CUDA_PASCAL_PREFILL_CUBLAS_GDN_QKV_ALGORITHM");
+    }
+    if (std::strstr(src0->name, ".attn_q.weight")) {
+        return std::getenv("QWEN38_CUDA_PASCAL_PREFILL_CUBLAS_ATTN_Q_ALGORITHM");
+    }
+    if (std::strstr(src0->name, ".attn_gate.weight")) {
+        return std::getenv("QWEN38_CUDA_PASCAL_PREFILL_CUBLAS_GDN_Z_ALGORITHM");
+    }
+    return nullptr;
+}
+
+static bool qwen38_cuda_pascal_prefill_cublas_weight_selected(const ggml_tensor * src0) {
+    if (std::strstr(src0->name, ".ffn_gate.weight") ||
+        std::strstr(src0->name, ".ffn_up.weight") ||
+        std::strstr(src0->name, ".ffn_down.weight")) {
+        return true;
+    }
+
+    const char * projection_algorithm = qwen38_cuda_pascal_prefill_cublas_projection_algorithm(src0);
+    if (projection_algorithm && projection_algorithm[0] != '\0') {
+        return true;
+    }
+
+    return qwen38_cuda_pascal_prefill_cublas_experiment_selected(src0);
+}
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1421,6 +1484,27 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const int64_t ne_dst = ggml_nelements(dst);
     cudaStream_t main_stream = ctx.stream();
     cublasHandle_t cublas_h = ctx.cublas_handle();
+
+    // Diagnostic-only attribution for the selected Pascal transient-FP16
+    // path.  It deliberately synchronizes every measured projection and is
+    // admitted only when CUDA graphs are disabled.  The normal node profiler
+    // reports the complete MUL_MAT time; these five events split that time
+    // into weight dequantization, activation conversion, cuBLAS GEMM, and
+    // output conversion so a persistent/tiled format is attempted only when
+    // its theoretical ceiling can matter end to end.
+    const bool qwen38_pascal_stage_profile =
+        std::getenv("QWEN38_CUDA_PASCAL_PREFILL_STAGE_PROFILE") != nullptr &&
+        std::getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr &&
+        ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_PASCAL &&
+        ne11 >= 128 && ggml_is_quantized(src0->type) &&
+        qwen38_cuda_pascal_prefill_cublas_weight_selected(src0);
+    cudaEvent_t qwen38_stage_events[5] = {};
+    if (qwen38_pascal_stage_profile) {
+        for (cudaEvent_t & event : qwen38_stage_events) {
+            CUDA_CHECK(cudaEventCreate(&event));
+        }
+        CUDA_CHECK(cudaEventRecord(qwen38_stage_events[0], main_stream));
+    }
 
     const size_t src0_ts = ggml_type_size(src0->type);
     GGML_ASSERT(nb00 == src0_ts);
@@ -1470,6 +1554,10 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_ptr = src0_alloc.get();
     }
 
+    if (qwen38_pascal_stage_profile) {
+        CUDA_CHECK(cudaEventRecord(qwen38_stage_events[1], main_stream));
+    }
+
     if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
     } else {
@@ -1495,6 +1583,10 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src1_ptr = src1_alloc.get();
     }
 
+    if (qwen38_pascal_stage_profile) {
+        CUDA_CHECK(cudaEventRecord(qwen38_stage_events[2], main_stream));
+    }
+
     ggml_cuda_pool_alloc<cuda_t> dst_temp(ctx.pool());
     char * dst_ptr;
     size_t nbd2 = dst->nb[2];
@@ -1508,6 +1600,32 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const void * beta = traits::get_beta();
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    cublasGemmAlgo_t gemm_algorithm = CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+    // GP100's default heuristic is more than 2x slower for Qwen3.8's
+    // 5120x17408, M=128..256 FFN shapes. The server manifest admits only the
+    // end-to-end-qualified algorithm 6; the environment variable remains
+    // numeric so direct llama-perplexity/benchmark invocations use the same
+    // implementation.
+    const char * prefill_algorithm = std::getenv("QWEN38_CUDA_PASCAL_PREFILL_CUBLAS_ALGORITHM");
+    if (cc == GGML_CUDA_CC_PASCAL && ne11 >= 128 && prefill_algorithm &&
+        qwen38_cuda_pascal_prefill_cublas_weight_selected(src0)) {
+        const char * selected_algorithm = prefill_algorithm;
+        const char * projection_algorithm =
+            qwen38_cuda_pascal_prefill_cublas_projection_algorithm(src0);
+        if (projection_algorithm && projection_algorithm[0] != '\0') {
+            selected_algorithm = projection_algorithm;
+        }
+        const char * experiment_algorithm =
+            std::getenv("QWEN38_CUDA_PASCAL_PREFILL_CUBLAS_EXPERIMENT_ALGORITHM");
+        if (experiment_algorithm &&
+            qwen38_cuda_pascal_prefill_cublas_experiment_selected(src0)) {
+            selected_algorithm = experiment_algorithm;
+        }
+        const int algorithm = std::atoi(selected_algorithm);
+        if (algorithm >= -1 && algorithm <= 23) {
+            gemm_algorithm = static_cast<cublasGemmAlgo_t>(algorithm);
+        }
+    }
     bool prefer_f32_output = false;
     if (compute_type == GGML_TYPE_F16) {
         prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
@@ -1556,7 +1674,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                            src1_ptr, cu_data_type_b, s11,
                     beta,   dst_ptr, cu_data_type,   ne0,
                     cu_compute_type,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    gemm_algorithm));
     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
         const int64_t sma = ne02 == 1 ? s03 : s02;
@@ -1572,7 +1690,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 beta,   dst_ptr, cu_data_type,   ne0, ne1*ne0, // strideC
                 ne12*ne13,
                 cu_compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                gemm_algorithm));
     } else {
         // use cublasGemmBatchedEx
         const int64_t ne23 = ne12*ne13;
@@ -1610,13 +1728,42 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 beta,  (      void **) (ptrs_dst.get() + 0*ne23), cu_data_type,   ne0,
                 ne23,
                 cu_compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                gemm_algorithm));
+    }
+
+    if (qwen38_pascal_stage_profile) {
+        CUDA_CHECK(cudaEventRecord(qwen38_stage_events[3], main_stream));
     }
 
     // Convert output back to F32 if needed
     if (cu_data_type != CUDA_R_32F) {
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(traits::ggml_type_val);
         to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
+    }
+
+    if (qwen38_pascal_stage_profile) {
+        CUDA_CHECK(cudaEventRecord(qwen38_stage_events[4], main_stream));
+        CUDA_CHECK(cudaEventSynchronize(qwen38_stage_events[4]));
+        float weight_ms = 0.0f;
+        float activation_ms = 0.0f;
+        float gemm_ms = 0.0f;
+        float output_ms = 0.0f;
+        float total_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&weight_ms,     qwen38_stage_events[0], qwen38_stage_events[1]));
+        CUDA_CHECK(cudaEventElapsedTime(&activation_ms, qwen38_stage_events[1], qwen38_stage_events[2]));
+        CUDA_CHECK(cudaEventElapsedTime(&gemm_ms,       qwen38_stage_events[2], qwen38_stage_events[3]));
+        CUDA_CHECK(cudaEventElapsedTime(&output_ms,     qwen38_stage_events[3], qwen38_stage_events[4]));
+        CUDA_CHECK(cudaEventElapsedTime(&total_ms,      qwen38_stage_events[0], qwen38_stage_events[4]));
+        GGML_LOG_INFO(
+            "qwen38_pascal_stage_profile tensor='%s' source=%s M=%" PRId64
+            " K=%" PRId64 " N=%" PRId64
+            " weight_dequant_ms=%.6f activation_f16_ms=%.6f gemm_ms=%.6f"
+            " output_f32_ms=%.6f total_ms=%.6f\n",
+            src0->name, ggml_type_name(src0->type), ne11, ne10, ne01,
+            weight_ms, activation_ms, gemm_ms, output_ms, total_ms);
+        for (cudaEvent_t event : qwen38_stage_events) {
+            CUDA_CHECK(cudaEventDestroy(event));
+        }
     }
 }
 
@@ -1661,6 +1808,159 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         default:
             GGML_ABORT("fatal error");
     }
+}
+
+struct qwen38_pascal_resident_fp16_entry {
+    half * data = nullptr;
+    size_t bytes = 0;
+};
+
+using qwen38_pascal_resident_fp16_cache_key = std::pair<int, const void *>;
+static std::mutex qwen38_pascal_resident_fp16_cache_mutex;
+static std::map<qwen38_pascal_resident_fp16_cache_key, qwen38_pascal_resident_fp16_entry>
+    qwen38_pascal_resident_fp16_cache;
+
+extern "C" void ggml_backend_cuda_qwen38_pascal_resident_fp16_clear() {
+    std::lock_guard<std::mutex> lock(qwen38_pascal_resident_fp16_cache_mutex);
+    if (qwen38_pascal_resident_fp16_cache.empty()) {
+        return;
+    }
+
+    const int original_device = ggml_cuda_get_device();
+    size_t released_bytes = 0;
+    for (auto & [key, entry] : qwen38_pascal_resident_fp16_cache) {
+        ggml_cuda_set_device(key.first);
+        CUDA_CHECK(cudaFree(entry.data));
+        released_bytes += entry.bytes;
+    }
+    qwen38_pascal_resident_fp16_cache.clear();
+    ggml_cuda_set_device(original_device);
+    GGML_LOG_INFO(
+        "qwen38 Pascal resident FP16 cache: released %.3f MiB\n",
+        released_bytes / (1024.0 * 1024.0));
+}
+
+static bool qwen38_cuda_pascal_prefill_resident_fp16_selected(
+        const ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst) {
+    // A separate diagnostic selector can override the manifest-owned policy
+    // for a short-lived benchmark process without weakening manifest parsing.
+    const char * selection = std::getenv("QWEN38_CUDA_PASCAL_PREFILL_RESIDENT_FP16_EXPERIMENT");
+    if (!selection) {
+        selection = std::getenv("QWEN38_CUDA_PASCAL_PREFILL_RESIDENT_FP16");
+    }
+    if (!selection ||
+        ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_PASCAL ||
+        !ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src1->ne[1] < 128) {
+        return false;
+    }
+
+    const bool gdn_qkv = std::strstr(src0->name, ".attn_qkv.weight");
+    const bool gdn_z   = std::strstr(src0->name, ".attn_gate.weight");
+    const bool gdn_out = std::strstr(src0->name, ".ssm_out.weight");
+    const bool attn_q  = std::strstr(src0->name, ".attn_q.weight");
+    const bool attn_kv = std::strstr(src0->name, ".attn_k.weight") ||
+                         std::strstr(src0->name, ".attn_v.weight");
+    const bool attn_out = std::strstr(src0->name, ".attn_output.weight");
+    if (std::strcmp(selection, "gdn_qkv") == 0) {
+        return gdn_qkv;
+    }
+    if (std::strcmp(selection, "gdn_z") == 0) {
+        return gdn_z;
+    }
+    if (std::strcmp(selection, "gdn_out") == 0) {
+        return gdn_out;
+    }
+    if (std::strcmp(selection, "attn_q") == 0) {
+        return attn_q;
+    }
+    if (std::strcmp(selection, "attn_kv") == 0) {
+        return attn_kv;
+    }
+    if (std::strcmp(selection, "attn_out") == 0) {
+        return attn_out;
+    }
+    if (std::strcmp(selection, "both") == 0) {
+        return gdn_qkv || attn_q;
+    }
+    if (std::strcmp(selection, "both_plus_small") == 0) {
+        return gdn_qkv || attn_q || attn_kv || attn_out;
+    }
+    if (std::strcmp(selection, "both_plus_attn_kv") == 0) {
+        return gdn_qkv || attn_q || attn_kv;
+    }
+    if (std::strcmp(selection, "both_plus_attn_out") == 0) {
+        return gdn_qkv || attn_q || attn_out;
+    }
+    if (std::strcmp(selection, "both_plus_gdn_z") == 0) {
+        return gdn_qkv || attn_q || gdn_z;
+    }
+    if (std::strcmp(selection, "both_plus_gdn_z_attn_kv") == 0) {
+        return gdn_qkv || attn_q || gdn_z || attn_kv;
+    }
+    if (std::strcmp(selection, "both_plus_gdn_z_attn_out") == 0) {
+        return gdn_qkv || attn_q || gdn_z || attn_out;
+    }
+    if (std::strcmp(selection, "both_plus_gdn_z_small") == 0) {
+        return gdn_qkv || attn_q || gdn_z || attn_kv || attn_out;
+    }
+    if (std::strcmp(selection, "both_plus_gdn_out") == 0) {
+        return gdn_qkv || attn_q || gdn_out;
+    }
+    return false;
+}
+
+static void qwen38_cuda_mul_mat_pascal_resident_fp16(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst) {
+    const qwen38_pascal_resident_fp16_cache_key key = {ctx.device, src0->data};
+    half * resident = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(qwen38_pascal_resident_fp16_cache_mutex);
+        qwen38_pascal_resident_fp16_entry & entry = qwen38_pascal_resident_fp16_cache[key];
+        if (!entry.data) {
+            entry.bytes = ggml_nelements(src0) * sizeof(half);
+            CUDA_CHECK(cudaMalloc(&entry.data, entry.bytes));
+            const to_fp16_cuda_t convert = ggml_get_to_fp16_cuda(src0->type);
+            GGML_ASSERT(convert != nullptr);
+            convert(src0->data, entry.data, ggml_nelements(src0), ctx.stream());
+            // Materialization happens during the CUDA-graph warm-up execution.
+            // Completing it here prevents another stream or the later capture
+            // from observing a partially initialized resident tensor.
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            GGML_LOG_INFO(
+                "qwen38 Pascal resident FP16 diagnostic: tensor='%s' source=%s bytes=%.3f MiB\n",
+                src0->name, ggml_type_name(src0->type), entry.bytes / (1024.0 * 1024.0));
+        }
+        resident = entry.data;
+    }
+
+    ggml_tensor fp16 = *src0;
+    fp16.type = GGML_TYPE_F16;
+    fp16.data = resident;
+    fp16.nb[0] = sizeof(half);
+    fp16.nb[1] = fp16.nb[0] * fp16.ne[0];
+    fp16.nb[2] = fp16.nb[1] * fp16.ne[1];
+    fp16.nb[3] = fp16.nb[2] * fp16.ne[2];
+    ggml_cuda_mul_mat_cublas(ctx, &fp16, src1, dst);
+}
+
+static bool qwen38_cuda_pascal_prefill_cublas_selected(
+        const ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst) {
+    const char * algorithm = std::getenv("QWEN38_CUDA_PASCAL_PREFILL_CUBLAS_ALGORITHM");
+    return algorithm && std::strcmp(algorithm, "6") == 0 &&
+        ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_PASCAL &&
+        ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src1->ne[1] >= 128 &&
+        qwen38_cuda_pascal_prefill_cublas_weight_selected(src0);
 }
 
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
@@ -1813,7 +2113,159 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+struct qwen38_layer_major_stage_entry {
+    ggml_backend_buffer_t buffer = nullptr;
+    void * data = nullptr;
+    size_t bytes = 0;
+};
+
+using qwen38_layer_major_stage_key = std::pair<int, const void *>;
+static std::mutex qwen38_layer_major_stage_mutex;
+static std::map<qwen38_layer_major_stage_key, qwen38_layer_major_stage_entry>
+    qwen38_layer_major_stage_cache;
+static thread_local bool qwen38_layer_major_stage_reentry = false;
+
+extern "C" bool ggml_backend_cuda_qwen38_layer_major_stage_tensor(
+        const ggml_tensor * src,
+        ggml_tensor       * proxy,
+        int                 device) {
+    if (!src || !proxy || !src->buffer || !src->data || device < 0 || device >= ggml_cuda_info().device_count) {
+        return false;
+    }
+
+    const qwen38_layer_major_stage_key key = {device, src->data};
+    std::lock_guard<std::mutex> lock(qwen38_layer_major_stage_mutex);
+    qwen38_layer_major_stage_entry & entry = qwen38_layer_major_stage_cache[key];
+    if (!entry.data) {
+        entry.bytes = ggml_nbytes(src);
+        const int original_device = ggml_cuda_get_device();
+        ggml_cuda_set_device(device);
+        entry.buffer = ggml_backend_buft_alloc_buffer(
+            ggml_backend_cuda_buffer_type(device), entry.bytes);
+        if (!entry.buffer) {
+            ggml_cuda_set_device(original_device);
+            return false;
+        }
+        ggml_backend_buffer_set_usage(entry.buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        entry.data = ggml_backend_buffer_get_base(entry.buffer);
+
+        const char * dry_run_env = getenv("QWEN38_PREFILL_RTX_DRY_RUN");
+        const bool dry_run = dry_run_env && atoi(dry_run_env) != 0;
+        if (!dry_run) {
+            CUDA_CHECK(cudaMemcpy(entry.data, src->data, entry.bytes, cudaMemcpyDefault));
+        }
+        ggml_cuda_set_device(original_device);
+        GGML_LOG_INFO(
+            "qwen38 layer-major proxy: tensor='%s' source=%s bytes=%.3f MiB device=%d dry_run=%d\n",
+            src->name, ggml_type_name(src->type), entry.bytes/(1024.0*1024.0), device, dry_run ? 1 : 0);
+    } else if (entry.bytes != ggml_nbytes(src)) {
+        GGML_ABORT("qwen38 layer-major proxy cache size mismatch");
+    }
+
+    proxy->buffer = entry.buffer;
+    proxy->data = entry.data;
+    ggml_format_name(proxy, "qwen38_stage.%s", src->name);
+    return true;
+}
+
+extern "C" void ggml_backend_cuda_qwen38_layer_major_stage_clear() {
+    std::lock_guard<std::mutex> lock(qwen38_layer_major_stage_mutex);
+    if (qwen38_layer_major_stage_cache.empty()) {
+        return;
+    }
+
+    const int original_device = ggml_cuda_get_device();
+    size_t released_bytes = 0;
+    for (auto & [key, entry] : qwen38_layer_major_stage_cache) {
+        ggml_cuda_set_device(key.first);
+        ggml_backend_buffer_free(entry.buffer);
+        released_bytes += entry.bytes;
+    }
+    qwen38_layer_major_stage_cache.clear();
+    ggml_cuda_set_device(original_device);
+    GGML_LOG_INFO("qwen38 layer-major stage: released %.3f MiB\n",
+        released_bytes/(1024.0*1024.0));
+}
+
+static int qwen38_layer_major_tensor_layer(const ggml_tensor * tensor) {
+    if (strncmp(tensor->name, "blk.", 4) != 0) {
+        return -1;
+    }
+    char * end = nullptr;
+    const long layer = strtol(tensor->name + 4, &end, 10);
+    return end && *end == '.' && layer >= 0 && layer <= INT_MAX ? (int) layer : -1;
+}
+
+static bool qwen38_cuda_layer_major_stage_selected(
+        const ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst) {
+    const char * enabled = getenv("QWEN38_PREFILL_RTX_LAYER_MAJOR_STAGE_CACHE");
+    const char * boundary_env = getenv("QWEN38_PREFILL_RTX_GRAPH_LAYERS");
+    const char * tokens_env = getenv("QWEN38_PREFILL_RTX_GRAPH_MIN_TOKENS");
+    const int boundary = boundary_env ? atoi(boundary_env) : 0;
+    const int min_tokens = tokens_env ? atoi(tokens_env) : INT_MAX;
+    const int layer = qwen38_layer_major_tensor_layer(src0);
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+
+    return !qwen38_layer_major_stage_reentry && enabled && atoi(enabled) != 0 &&
+        GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE &&
+        layer >= 0 && layer < boundary && src1->ne[1] >= min_tokens &&
+        ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src0->buffer && ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
+static const ggml_tensor * qwen38_cuda_layer_major_stage_weight(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        ggml_tensor & local) {
+    const qwen38_layer_major_stage_key key = {ctx.device, src0->data};
+    void * resident = nullptr;
+    ggml_backend_buffer_t resident_buffer = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(qwen38_layer_major_stage_mutex);
+        qwen38_layer_major_stage_entry & entry = qwen38_layer_major_stage_cache[key];
+        if (!entry.data) {
+            entry.bytes = ggml_nbytes(src0);
+            entry.buffer = ggml_backend_buft_alloc_buffer(
+                ggml_backend_cuda_buffer_type(ctx.device), entry.bytes);
+            if (!entry.buffer) {
+                GGML_ABORT("qwen38 layer-major stage buffer allocation failed");
+            }
+            ggml_backend_buffer_set_usage(entry.buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            entry.data = ggml_backend_buffer_get_base(entry.buffer);
+            CUDA_CHECK(cudaMemcpyAsync(entry.data, src0->data, entry.bytes,
+                cudaMemcpyDefault, ctx.stream()));
+            // The cache is shared by every equal-shape graph submission and
+            // may subsequently be observed during CUDA graph capture.
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            GGML_LOG_INFO(
+                "qwen38 layer-major stage: tensor='%s' source=%s bytes=%.3f MiB device=%d\n",
+                src0->name, ggml_type_name(src0->type), entry.bytes/(1024.0*1024.0), ctx.device);
+        } else if (entry.bytes != ggml_nbytes(src0)) {
+            GGML_ABORT("qwen38 layer-major stage cache size mismatch");
+        }
+        resident = entry.data;
+        resident_buffer = entry.buffer;
+    }
+
+    local = *src0;
+    local.data = resident;
+    local.buffer = resident_buffer;
+    return &local;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (qwen38_cuda_layer_major_stage_selected(ctx, src0, src1, dst)) {
+        ggml_tensor local;
+        const ggml_tensor * staged = qwen38_cuda_layer_major_stage_weight(ctx, src0, local);
+        qwen38_layer_major_stage_reentry = true;
+        ggml_cuda_mul_mat(ctx, staged, src1, dst);
+        qwen38_layer_major_stage_reentry = false;
+        return;
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
@@ -1860,6 +2312,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (qwen38_cuda_pascal_prefill_resident_fp16_selected(ctx, src0, src1, dst)) {
+        qwen38_cuda_mul_mat_pascal_resident_fp16(ctx, src0, src1, dst);
+        return;
+    }
+    if (qwen38_cuda_pascal_prefill_cublas_selected(ctx, src0, src1, dst)) {
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
@@ -2087,7 +2547,42 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_dup(ctx, dst);
             break;
         case GGML_OP_CPY:
-            ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
+            {
+                // A layer-major prefill graph reuses one stable scheduler
+                // allocation while it walks every prompt chunk through the
+                // same layer.  Preserve the peer-copied weights in that slot
+                // after the first chunk.  This is deliberately a separate,
+                // opt-in mode: an ordinary full-model graph reuses staging
+                // addresses for later layers, so it must execute every copy.
+                static std::mutex stage_cache_mutex;
+                struct stage_cache_entry {
+                    const void * source = nullptr;
+                    size_t       bytes  = 0;
+                };
+                static std::map<std::pair<int, void *>, stage_cache_entry> stage_cache;
+
+                const char * stage_cache_env = getenv("QWEN38_PREFILL_RTX_LAYER_MAJOR_STAGE_CACHE");
+                const bool stage_cache_enabled = stage_cache_env && atoi(stage_cache_env) != 0 &&
+                    strncmp(dst->name, "prefill_weight_stage-", strlen("prefill_weight_stage-")) == 0;
+                bool stage_cache_hit = false;
+                const auto cache_key = std::make_pair(ctx.device, dst->data);
+                const stage_cache_entry wanted = { dst->src[0]->data, ggml_nbytes(dst) };
+
+                if (stage_cache_enabled) {
+                    std::lock_guard<std::mutex> lock(stage_cache_mutex);
+                    const auto found = stage_cache.find(cache_key);
+                    stage_cache_hit = found != stage_cache.end() &&
+                        found->second.source == wanted.source && found->second.bytes == wanted.bytes;
+                }
+
+                if (!stage_cache_hit) {
+                    ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
+                    if (stage_cache_enabled) {
+                        std::lock_guard<std::mutex> lock(stage_cache_mutex);
+                        stage_cache[cache_key] = wanted;
+                    }
+                }
+            }
             break;
         case GGML_OP_CONT:
             ggml_cuda_dup(ctx, dst);
@@ -2380,6 +2875,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+            break;
+        case GGML_OP_QWEN38_PASCAL_FFN:
+            ggml_cuda_op_qwen38_pascal_ffn(ctx, dst);
+            break;
+        case GGML_OP_QWEN38_PASCAL_GDN_IN:
+            ggml_cuda_op_qwen38_pascal_gdn_in(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -4020,6 +4521,52 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
     bool                         should_launch_concurrent_events = false;
 
+    // Diagnostic operator attribution for the heterogeneous Qwen3.8 runtime.
+    // The profiler is deliberately opt-in and synchronizes every recorded
+    // event after the graph, so it must never be enabled in production.  It
+    // selects only CUDA subgraphs containing a sufficiently wide GDN prompt
+    // operation; startup/decode graphs therefore do not consume the sample
+    // budget.  CUDA graphs should be disabled during a profiling run so every
+    // logical ggml operation is visible here.
+    struct qwen38_cuda_node_profile_record {
+        cudaEvent_t begin = nullptr;
+        cudaEvent_t end   = nullptr;
+        std::string op;
+        std::string name;
+        std::string last_name;
+        int64_t ne[4] = {};
+        int fused_nodes = 1;
+        float elapsed_ms = 0.0f;
+    };
+
+    int64_t qwen38_profile_prompt_tokens = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_GATED_DELTA_NET && node->src[2] != nullptr) {
+            qwen38_profile_prompt_tokens = std::max(qwen38_profile_prompt_tokens, node->src[2]->ne[2]);
+        }
+    }
+
+    static std::atomic<int> qwen38_node_profile_sample { 0 };
+    const char * qwen38_node_profile_value = getenv("QWEN38_CUDA_PROFILE_NODES");
+    const int qwen38_node_profile_limit = qwen38_node_profile_value ?
+        std::max(0, atoi(qwen38_node_profile_value)) : 0;
+    const char * qwen38_node_profile_min_value = getenv("QWEN38_CUDA_PROFILE_MIN_TOKENS");
+    const int64_t qwen38_node_profile_min_tokens = qwen38_node_profile_min_value ?
+        std::max(1, atoi(qwen38_node_profile_min_value)) : 64;
+    const bool qwen38_node_profile_qualifies = qwen38_node_profile_limit > 0 &&
+        qwen38_profile_prompt_tokens >= qwen38_node_profile_min_tokens;
+    const int qwen38_node_profile_id = qwen38_node_profile_qualifies ?
+        qwen38_node_profile_sample.fetch_add(1, std::memory_order_relaxed) : -1;
+    const bool qwen38_node_profile = qwen38_node_profile_id >= 0 &&
+        qwen38_node_profile_id < qwen38_node_profile_limit && !use_cuda_graph;
+    std::vector<qwen38_cuda_node_profile_record> qwen38_node_profile_records;
+    qwen38_node_profile_records.reserve(qwen38_node_profile ? cgraph->n_nodes : 0);
+
+    if (qwen38_node_profile_qualifies && qwen38_node_profile_id < qwen38_node_profile_limit && use_cuda_graph) {
+        GGML_LOG_WARN("QWEN38_CUDA_PROFILE_NODES requires GGML_CUDA_DISABLE_GRAPHS=1; qualifying graph was not profiled\n");
+    }
+
     const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
         if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
             concurrent_event = &stream_ctx.concurrent_events[node];
@@ -4149,9 +4696,28 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (qwen38_node_profile) {
+                    qwen38_cuda_node_profile_record record;
+                    CUDA_CHECK(cudaEventCreate(&record.begin));
+                    CUDA_CHECK(cudaEventCreate(&record.end));
+                    record.op   = ggml_op_name(node->op);
+                    record.name = node->name;
+                    for (int d = 0; d < 4; ++d) {
+                        record.ne[d] = node->ne[d];
+                    }
+                    CUDA_CHECK(cudaEventRecord(record.begin, cuda_ctx->stream()));
+                    qwen38_node_profile_records.emplace_back(std::move(record));
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    if (qwen38_node_profile) {
+                        qwen38_cuda_node_profile_record & record = qwen38_node_profile_records.back();
+                        record.fused_nodes = nodes_to_skip + 1;
+                        record.last_name   = cgraph->nodes[i + nodes_to_skip]->name;
+                        CUDA_CHECK(cudaEventRecord(record.end, cuda_ctx->stream()));
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4183,6 +4749,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (qwen38_node_profile) {
+                    CUDA_CHECK(cudaEventRecord(qwen38_node_profile_records.back().end, cuda_ctx->stream()));
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4225,6 +4795,72 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
+
+    if (qwen38_node_profile) {
+        struct qwen38_cuda_node_profile_aggregate {
+            int count = 0;
+            float elapsed_ms = 0.0f;
+        };
+        std::map<std::string, qwen38_cuda_node_profile_aggregate> aggregates;
+        float serial_sum_ms = 0.0f;
+
+        for (qwen38_cuda_node_profile_record & record : qwen38_node_profile_records) {
+            CUDA_CHECK(cudaEventSynchronize(record.end));
+            CUDA_CHECK(cudaEventElapsedTime(&record.elapsed_ms, record.begin, record.end));
+            serial_sum_ms += record.elapsed_ms;
+            qwen38_cuda_node_profile_aggregate & aggregate = aggregates[record.op];
+            aggregate.count += 1;
+            aggregate.elapsed_ms += record.elapsed_ms;
+        }
+
+        fprintf(stderr,
+            "qwen38_cuda_node_profile: sample=%d device=%d prompt_tokens=%" PRId64 " graph_nodes=%d timed_groups=%zu serial_sum_ms=%.6f\n",
+            qwen38_node_profile_id,
+            cuda_ctx->device,
+            qwen38_profile_prompt_tokens,
+            cgraph->n_nodes,
+            qwen38_node_profile_records.size(),
+            serial_sum_ms);
+        for (const auto & [op, aggregate] : aggregates) {
+            fprintf(stderr,
+                "qwen38_cuda_node_profile_op: sample=%d device=%d op=%s count=%d elapsed_ms=%.6f share=%.3f\n",
+                qwen38_node_profile_id,
+                cuda_ctx->device,
+                op.c_str(),
+                aggregate.count,
+                aggregate.elapsed_ms,
+                serial_sum_ms > 0.0f ? aggregate.elapsed_ms / serial_sum_ms : 0.0f);
+        }
+
+        std::stable_sort(qwen38_node_profile_records.begin(), qwen38_node_profile_records.end(),
+            [](const qwen38_cuda_node_profile_record & lhs, const qwen38_cuda_node_profile_record & rhs) {
+                return lhs.elapsed_ms > rhs.elapsed_ms;
+            });
+        const char * qwen38_node_profile_top_value = getenv("QWEN38_CUDA_PROFILE_TOP");
+        const int qwen38_node_profile_top = qwen38_node_profile_top_value ?
+            std::max(0, atoi(qwen38_node_profile_top_value)) : 40;
+        const int qwen38_node_profile_print = std::min<int>(qwen38_node_profile_top, qwen38_node_profile_records.size());
+        for (int rank = 0; rank < qwen38_node_profile_print; ++rank) {
+            const qwen38_cuda_node_profile_record & record = qwen38_node_profile_records[rank];
+            fprintf(stderr,
+                "qwen38_cuda_node_profile_top: sample=%d device=%d rank=%d op=%s elapsed_ms=%.6f fused=%d name='%s' last='%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                qwen38_node_profile_id,
+                cuda_ctx->device,
+                rank,
+                record.op.c_str(),
+                record.elapsed_ms,
+                record.fused_nodes,
+                record.name.c_str(),
+                record.last_name.c_str(),
+                record.ne[0], record.ne[1], record.ne[2], record.ne[3]);
+        }
+        fflush(stderr);
+
+        for (qwen38_cuda_node_profile_record & record : qwen38_node_profile_records) {
+            CUDA_CHECK(cudaEventDestroy(record.end));
+            CUDA_CHECK(cudaEventDestroy(record.begin));
+        }
+    }
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -4248,6 +4884,27 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // Nsight CUDA injection is unavailable with the private mixed
+    // open/proprietary R580 stack.  Keep a deliberately opt-in graph timer so
+    // the heterogeneous runtime can still attribute target and draft time to
+    // the physical GPUs.  Events bracket the backend graph on its main stream;
+    // concurrent regions join that stream before graph completion.  The
+    // synchronize makes this a diagnostic mode only and is never enabled by a
+    // production manifest.
+    static std::atomic<int> qwen38_profile_sample { 0 };
+    const char * qwen38_profile_value = getenv("QWEN38_CUDA_PROFILE_GRAPHS");
+    const int qwen38_profile_limit = qwen38_profile_value ? std::max(0, atoi(qwen38_profile_value)) : 0;
+    const int qwen38_profile_id = qwen38_profile_limit > 0 ?
+        qwen38_profile_sample.fetch_add(1, std::memory_order_relaxed) : qwen38_profile_limit;
+    const bool qwen38_profile = qwen38_profile_id >= 0 && qwen38_profile_id < qwen38_profile_limit;
+    cudaEvent_t qwen38_profile_begin = nullptr;
+    cudaEvent_t qwen38_profile_end   = nullptr;
+    if (qwen38_profile) {
+        CUDA_CHECK(cudaEventCreate(&qwen38_profile_begin));
+        CUDA_CHECK(cudaEventCreate(&qwen38_profile_end));
+        CUDA_CHECK(cudaEventRecord(qwen38_profile_begin, cuda_ctx->stream()));
+    }
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -4299,6 +4956,28 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (qwen38_profile) {
+        CUDA_CHECK(cudaEventRecord(qwen38_profile_end, cuda_ctx->stream()));
+        CUDA_CHECK(cudaEventSynchronize(qwen38_profile_end));
+        float elapsed_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, qwen38_profile_begin, qwen38_profile_end));
+        const char * first_name = cgraph->n_nodes > 0 ? cgraph->nodes[0]->name : "";
+        const char * last_name  = cgraph->n_nodes > 0 ? cgraph->nodes[cgraph->n_nodes - 1]->name : "";
+        fprintf(stderr,
+            "qwen38_cuda_graph_profile: sample=%d device=%d nodes=%d first='%s' last='%s' elapsed_ms=%.6f graph=%d update=%d\n",
+            qwen38_profile_id,
+            cuda_ctx->device,
+            cgraph->n_nodes,
+            first_name,
+            last_name,
+            elapsed_ms,
+            use_cuda_graph ? 1 : 0,
+            cuda_graph_update_required ? 1 : 0);
+        fflush(stderr);
+        CUDA_CHECK(cudaEventDestroy(qwen38_profile_end));
+        CUDA_CHECK(cudaEventDestroy(qwen38_profile_begin));
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -4878,6 +5557,23 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     }
 
     switch (op->op) {
+        case GGML_OP_QWEN38_PASCAL_FFN: {
+            const int layer = ggml_get_op_params_i32(op, 0);
+            return ggml_cuda_info().devices[dev_ctx->device].cc == GGML_CUDA_CC_PASCAL &&
+                ggml_cuda_qwen38_pascal_ffn_registered(dev_ctx->device, layer) &&
+                op->type == GGML_TYPE_F32 && op->src[0] && op->src[1] &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op) && ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) && ggml_nelements(op) == 5120;
+        }
+        case GGML_OP_QWEN38_PASCAL_GDN_IN: {
+            const int layer = ggml_get_op_params_i32(op, 0);
+            return ggml_cuda_info().devices[dev_ctx->device].cc == GGML_CUDA_CC_PASCAL &&
+                ggml_cuda_qwen38_pascal_gdn_in_registered(dev_ctx->device, layer) &&
+                op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op) && ggml_is_contiguous(op->src[0]) &&
+                ggml_nelements(op) == 10240 + 6144 && ggml_nelements(op->src[0]) == 5120;
+        }
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
                 case GGML_UNARY_OP_ABS:
@@ -5028,7 +5724,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            (
                                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
-                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
+                               op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_Q8_KV64 ||
+                               op->type == GGML_TYPE_Q8_KV128 || op->type == GGML_TYPE_Q8_KV256 || op->type == GGML_TYPE_IQ4_NL) &&
                                op->src[0]->type == GGML_TYPE_F32
                            ) || (
                                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
@@ -5052,10 +5749,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 ) {
                     return true;
                 }
-                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q8_0) {
+                if (src0_type == GGML_TYPE_F32 &&
+                    (src1_type == GGML_TYPE_Q8_0 || src1_type == GGML_TYPE_Q8_KV64 || src1_type == GGML_TYPE_Q8_KV128 || src1_type == GGML_TYPE_Q8_KV256)) {
                     return true;
                 }
-                if (src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_F32) {
+                if ((src0_type == GGML_TYPE_Q8_0 || src0_type == GGML_TYPE_Q8_KV64 || src0_type == GGML_TYPE_Q8_KV128 || src0_type == GGML_TYPE_Q8_KV256) &&
+                    src1_type == GGML_TYPE_F32) {
                     return true;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q4_0) {

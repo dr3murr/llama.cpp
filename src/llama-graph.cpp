@@ -16,8 +16,13 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -125,7 +130,7 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->pos && pos) {
+    if (ubatch->pos && pos && pos->buffer) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         if (ubatch->token && n_pos_per_embd == 4) {
@@ -155,7 +160,7 @@ bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->pos && attn_scale) {
+    if (ubatch->pos && attn_scale && attn_scale->buffer) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         GGML_ASSERT(f_attn_temp_scale != 0.0f);
@@ -1084,22 +1089,31 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    // Diagnostic layer-major graphs may contain only a recurrent layer or
+    // only an attention layer.  Inputs for the absent half are pruned by the
+    // allocator and therefore have no backing buffer.
+    if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
+        mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    }
+    if (inp_attn->self_v_idxs && inp_attn->self_v_idxs->buffer) {
+        mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    }
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
-    if (inp_attn->self_k_rot) {
+    if (inp_attn->self_k_rot && inp_attn->self_k_rot->buffer) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
     }
 
-    if (inp_attn->self_v_rot) {
+    if (inp_attn->self_v_rot && inp_attn->self_v_rot->buffer) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1137,13 +1151,17 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 // Instead of creating a hybrid input, the graph can simply create 2 separate inputs.
 // Refactoring is required in the future.
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
+        mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    }
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1512,6 +1530,37 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    ggml_tensor * w_lora = w;
+
+    const char * stage_env = getenv("QWEN38_PREFILL_RTX_STAGE_WEIGHTS");
+    const char * layers_env = getenv("QWEN38_PREFILL_RTX_GRAPH_LAYERS");
+    const char * tokens_env = getenv("QWEN38_PREFILL_RTX_GRAPH_MIN_TOKENS");
+    const int stage_layers = layers_env ? atoi(layers_env) : 0;
+    const uint32_t stage_tokens = tokens_env ? (uint32_t) atoi(tokens_env) : std::numeric_limits<uint32_t>::max();
+    const char * layer_major_cache_env = getenv("QWEN38_PREFILL_RTX_LAYER_MAJOR_STAGE_CACHE");
+    const bool layer_major_cache = layer_major_cache_env && atoi(layer_major_cache_env) != 0;
+    char * layer_end = nullptr;
+    const long layer = strncmp(w->name, "blk.", 4) == 0 ? strtol(w->name + 4, &layer_end, 10) : -1;
+    if (stage_env && atoi(stage_env) != 0 && layer >= 0 && layer < stage_layers &&
+            layer_end && *layer_end == '.' && ubatch.n_tokens >= stage_tokens) {
+        if (layer_major_cache && ggml_is_quantized(w->type)) {
+#ifdef GGML_USE_CUDA
+            const char * device_env = getenv("QWEN38_PREFILL_RTX_STAGE_DEVICE");
+            const int device = device_env ? atoi(device_env) : 1;
+            ggml_tensor * proxy = ggml_dup_tensor(ctx0, w);
+            if (!ggml_backend_cuda_qwen38_layer_major_stage_tensor(w, proxy, device)) {
+                GGML_ABORT("failed to stage Qwen3.8 layer-major weight '%s' on CUDA%d", w->name, device);
+            }
+            w = proxy;
+#else
+            GGML_ABORT("QWEN38_PREFILL_RTX_LAYER_MAJOR_STAGE_CACHE requires CUDA");
+#endif
+        } else if (!layer_major_cache) {
+            w = ggml_cast(ctx0, w, w->type);
+            cb(w, "prefill_weight_stage", (int) layer);
+        }
+    }
+
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     if (w_s) {
@@ -1519,7 +1568,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     }
 
     for (const auto & lora : *loras) {
-        llama_adapter_lora_weight * lw = lora.first->get_weight(w);
+        llama_adapter_lora_weight * lw = lora.first->get_weight(w_lora);
         if (lw == nullptr) {
             continue;
         }
@@ -2548,7 +2597,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il) const {
-    const bool v_trans = v->nb[1] > v->nb[2];
+    // The legacy transposed-V cache and the Qwen3.8 persistent head-major
+    // cache both have nb[1] > nb[2], but only the former needs an additional
+    // transpose below.  In the head-major layout dim 1 is still the KV-head
+    // dimension and dim 2 is still the token dimension; only their physical
+    // strides changed.
+    const bool persistent_head_major_v =
+        v->type == GGML_TYPE_Q8_KV256 &&
+        v->ne[0] == hparams.n_embd_head_v(il) &&
+        v->ne[1] == hparams.n_head_kv(il) &&
+        v->nb[2] == ggml_row_size(v->type, v->ne[0]);
+    const bool v_trans = v->nb[1] > v->nb[2] && !persistent_head_major_v;
 
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];

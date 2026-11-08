@@ -1,0 +1,4 @@
+#include "../fattn-mma-f16.cuh"
+
+DECL_FATTN_MMA_Q8_KV256_CASE(256, 256, 8, 8);
+DECL_FATTN_MMA_Q8_KV256_CASE(256, 256, 32, 2);

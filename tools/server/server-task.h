@@ -53,6 +53,11 @@ struct task_params {
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
     bool return_progress = false;
+    // Private phase-prefill mode: evaluate and retain prompt state without
+    // building the final logits/output graph.  This is used by the
+    // heterogeneous Qwen3.8 prefill service before snapshot migration into
+    // the normal decode placement.
+    bool prefill_only    = false;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
 
@@ -194,6 +199,9 @@ struct server_task {
     }
 
     bool need_logits() const {
+        if (params.prefill_only) {
+            return false;
+        }
         switch (type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
@@ -204,6 +212,9 @@ struct server_task {
     }
 
     bool need_sampling() const {
+        if (params.prefill_only) {
+            return false;
+        }
         switch (type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:

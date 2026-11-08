@@ -177,8 +177,8 @@ public:
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo, uint32_t n_kv = 0) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo, uint32_t n_kv = 0) const;
 
     //
     // preparation API
@@ -233,9 +233,22 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // Qwen3.8 RTX-only experiment: keep independently quantized KV-head
+        // rows contiguous over tokens.  The ordinary cache is token-major.
+        bool head_major = false;
+
+        // The same allocation contains the opt-in Sage-native INT8 K and
+        // transposed E4M3 V payloads instead of independent Q8 rows.
+        bool sage = false;
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    // If any layer is head-major, graph input indices contain the ordinary
+    // token indices followed by one destination index per token/KV head.
+    bool     has_head_major       = false;
+    uint32_t head_major_max_heads = 0;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -316,10 +329,10 @@ private:
     };
 
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
+    void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr, llama_state_seq_flags flags) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
-    bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+    bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo, llama_state_seq_flags flags);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

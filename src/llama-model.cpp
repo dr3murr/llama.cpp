@@ -2378,11 +2378,29 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_MINIMAX_01) {
-                        filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                        int32_t memory_layer_start = 0;
+                        int32_t memory_layer_end = (int32_t) hparams.n_layer();
+                        if (const char * value = std::getenv("QWEN38_MEMORY_LAYER_START")) {
+                            memory_layer_start = std::atoi(value);
+                        }
+                        if (const char * value = std::getenv("QWEN38_MEMORY_LAYER_END")) {
+                            memory_layer_end = std::atoi(value);
+                        }
+                        if (memory_layer_start < 0 || memory_layer_end <= memory_layer_start ||
+                                memory_layer_end > (int32_t) hparams.n_layer()) {
+                            throw std::runtime_error("invalid QWEN38_MEMORY_LAYER_START/END range");
+                        }
+                        if (memory_layer_start != 0 || memory_layer_end != (int32_t) hparams.n_layer()) {
+                            LLAMA_LOG_INFO("%s: limiting Qwen hybrid memory to layers [%d, %d)\n",
+                                    __func__, memory_layer_start, memory_layer_end);
+                        }
+                        filter_attn = [&, memory_layer_start, memory_layer_end](uint32_t il) {
+                            return il >= (uint32_t) memory_layer_start && il < (uint32_t) memory_layer_end &&
+                                il < hparams.n_layer() && !hparams.is_recr(il);
                         };
-                        filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
+                        filter_recr = [&, memory_layer_start, memory_layer_end](uint32_t il) {
+                            return il >= (uint32_t) memory_layer_start && il < (uint32_t) memory_layer_end &&
+                                il < hparams.n_layer() && hparams.is_recr(il);
                         };
                     }
 

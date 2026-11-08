@@ -40,6 +40,43 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
+// Private Qwen3.8 SM60 development path. The device argument is the logical
+// CUDA backend index (the same index accepted by ggml_backend_cuda_init).
+// Registration owns persistent device copies until explicitly unregistered.
+GGML_BACKEND_API bool ggml_backend_cuda_qwen38_pascal_ffn_register(
+        int          device,
+        int          layer,
+        const char * gate_up_path,
+        const char * down_path,
+        char       * error,
+        size_t       error_size);
+GGML_BACKEND_API void ggml_backend_cuda_qwen38_pascal_ffn_unregister(int device, int layer);
+GGML_BACKEND_API bool ggml_backend_cuda_qwen38_pascal_ffn_is_registered(int device, int layer);
+
+GGML_BACKEND_API bool ggml_backend_cuda_qwen38_pascal_gdn_in_register(
+        int          device,
+        int          layer,
+        const char * qkv_path,
+        const char * z_path,
+        char       * error,
+        size_t       error_size);
+GGML_BACKEND_API void ggml_backend_cuda_qwen38_pascal_gdn_in_unregister(int device, int layer);
+GGML_BACKEND_API bool ggml_backend_cuda_qwen38_pascal_gdn_in_is_registered(int device, int layer);
+
+// Releases the private Qwen3.8 Pascal resident-FP16 prefill cache.  The
+// hybrid server calls this after model execution has stopped and before the
+// CUDA backend is shut down so a later process/model cannot inherit entries
+// keyed by stale tensor addresses.
+GGML_BACKEND_API void ggml_backend_cuda_qwen38_pascal_resident_fp16_clear(void);
+
+// Releases exact packed-weight copies owned by the experimental Qwen3.8
+// layer-major prefill executor after one staged layer completes.
+GGML_BACKEND_API bool ggml_backend_cuda_qwen38_layer_major_stage_tensor(
+        const struct ggml_tensor * src,
+        struct ggml_tensor       * proxy,
+        int                        device);
+GGML_BACKEND_API void ggml_backend_cuda_qwen38_layer_major_stage_clear(void);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
 #ifdef  __cplusplus

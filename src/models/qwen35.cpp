@@ -1,6 +1,50 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+
+static bool qwen38_pascal_layer_enabled(const char * variable, const int layer) {
+    const char * value = std::getenv(variable);
+    if (!value) {
+        return false;
+    }
+    while (*value) {
+        char * end = nullptr;
+        const long candidate = std::strtol(value, &end, 10);
+        if (end != value && candidate == layer) {
+            return true;
+        }
+        if (end == value) {
+            ++value;
+        } else {
+            value = end;
+        }
+        while (*value == ',' || *value == ';' || *value == ' ') {
+            ++value;
+        }
+    }
+    return false;
+}
+
+static bool qwen38_pascal_ffn_enabled(const int layer) {
+    return qwen38_pascal_layer_enabled("QWEN38_PASCAL_FFN_LAYERS", layer);
+}
+
+static bool qwen38_pascal_gdn_in_enabled(const int layer) {
+    return qwen38_pascal_layer_enabled("QWEN38_PASCAL_GDN_IN_LAYERS", layer);
+}
+
+static int qwen38_diagnostic_layer_bound(const char * variable, const int fallback) {
+    const char * value = std::getenv(variable);
+    if (!value || !*value) {
+        return fallback;
+    }
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    GGML_ASSERT(end != value && *end == '\0');
+    return (int) parsed;
+}
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -150,13 +194,41 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(inpL, "model.input_embed", -1);
 
+    // Diagnostic-only partial graph used by the UniPrefill compacted
+    // macroblock harness.  With vector embeddings in the input batch, inpL is
+    // the captured hidden stream at layer_start.  Production leaves both
+    // variables unset and therefore executes the ordinary complete graph.
+    const bool diagnostic_graph = getenv("QWEN38_DIAGNOSTIC_LAYER_START") != nullptr ||
+                                  getenv("QWEN38_DIAGNOSTIC_LAYER_END") != nullptr;
+    const bool diagnostic_output_head = getenv("QWEN38_DIAGNOSTIC_OUTPUT_HEAD") != nullptr;
+    const int layer_start = qwen38_diagnostic_layer_bound("QWEN38_DIAGNOSTIC_LAYER_START", 0);
+    const int layer_end   = qwen38_diagnostic_layer_bound("QWEN38_DIAGNOSTIC_LAYER_END", n_layer);
+    if (diagnostic_output_head) {
+        GGML_ASSERT(diagnostic_graph && layer_start == n_layer && layer_end == n_layer);
+
+        cur = build_norm(inpL, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "diagnostic_result_norm", -1);
+        res->t_embd = cur;
+
+        cur = build_lora_mm(model.output, cur, model.output_s);
+        cb(cur, "diagnostic_result_output", -1);
+        res->t_logits = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
+    GGML_ASSERT(layer_start >= 0 && layer_start < n_layer);
+    GGML_ASSERT(layer_end > layer_start && layer_end <= n_layer);
+
     auto * inp = build_inp_mem_hybrid();
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos = build_inp_pos();
+    // A partial graph has no LM head and therefore no output-row selection.
+    // Do not register an unused input: graph allocation intentionally omits it.
+    ggml_tensor * inp_out_ids = !diagnostic_graph && layer_end == n_layer ? build_inp_out_ids() : nullptr;
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = layer_start; il < layer_end; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -191,12 +263,22 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
-        // Dense FFN layer - without residual connection
-        cur = build_layer_ffn(attn_post_norm, il);
-        cb(cur, "ffn_out", il);
+        // The private Pascal path is deliberately decode-only. Prefill and all
+        // other layers retain the ordinary graph, which also gives us a safe
+        // correctness fallback while the custom backend is being expanded.
+        const bool use_pascal_ffn = qwen38_pascal_ffn_enabled(il) &&
+            ggml_nelements(attn_post_norm) == 5120;
+        if (use_pascal_ffn) {
+            cur = ggml_qwen38_pascal_ffn(ctx0, attn_post_norm, ffn_residual, il);
+            cb(cur, "ffn_pascal_fused", il);
+        } else {
+            // Dense FFN layer - without residual connection
+            cur = build_layer_ffn(attn_post_norm, il);
+            cb(cur, "ffn_out", il);
 
-        // Residual connection for FFN - add to the tensor from before post_attention_layernorm
-        cur = ggml_add(ctx0, cur, ffn_residual);
+            // Residual connection for FFN - add to the tensor from before post_attention_layernorm
+            cur = ggml_add(ctx0, cur, ffn_residual);
+        }
         cb(cur, "post_ffn", il);
 
         cur = build_cvec(cur, il);
@@ -205,7 +287,22 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         // Input for next layer
         inpL = cur;
     }
+
+    if (diagnostic_graph) {
+        // Expose the unnormalized hidden stream entering the following layer.
+        // This is the natural comparison/scatter boundary for a compacted
+        // attention + three-GDN macroblock and deliberately omits the LM head.
+        res->t_layer_inp[layer_end] = inpL;
+        cb(inpL, "diagnostic_layer_out", layer_end);
+        ggml_build_forward_expand(gf, inpL);
+        return;
+    }
     cur = inpL;
+
+    // Expose the final unnormalized hidden stream for the same diagnostic
+    // capture API used at ordinary layer boundaries.  This is inert unless a
+    // caller explicitly requests layer n_layer embeddings.
+    res->t_layer_inp[n_layer] = inpL;
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
@@ -233,6 +330,19 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
                         int   il) {
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+
+    if (qwen38_pascal_gdn_in_enabled(il) && ggml_nelements(input) == 5120) {
+        ggml_tensor * combined = ggml_qwen38_pascal_gdn_in(ctx0, input, il);
+        cb(combined, "gdn_pascal_in", il);
+
+        ggml_tensor * qkv_mixed = ggml_view_1d(ctx0, combined, 10240, 0);
+        qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, 10240, n_seq_tokens, n_seqs);
+        cb(qkv_mixed, "linear_attn_qkv_mixed", il);
+
+        ggml_tensor * z = ggml_view_1d(ctx0, combined, 6144, 10240 * sizeof(float));
+        cb(z, "z", il);
+        return { qkv_mixed, z };
+    }
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
@@ -438,7 +548,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     // if head keys and value keys are different, repeat to force tensors into matching shapes
     // note: need explicit repeat only if we are not using the fused GDN.
-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+    const bool use_fused_gdn = n_seq_tokens == 1 ? cparams.fused_gdn_ar : !use_delta_net_chunk_split(il);
+    if (num_k_heads != num_v_heads && !use_fused_gdn) {
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
         q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
         k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);

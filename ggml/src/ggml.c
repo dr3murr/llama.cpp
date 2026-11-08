@@ -741,6 +741,30 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q8_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_ref,
     },
+    [GGML_TYPE_Q8_KV64] = {
+        .type_name                = "q8_kv64",
+        .blck_size                = QK8_KV64,
+        .type_size                = sizeof(block_q8_kv64),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q8_kv64,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q8_kv64_ref,
+    },
+    [GGML_TYPE_Q8_KV128] = {
+        .type_name                = "q8_kv128",
+        .blck_size                = QK8_KV128,
+        .type_size                = sizeof(block_q8_kv128),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q8_kv128,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q8_kv128_ref,
+    },
+    [GGML_TYPE_Q8_KV256] = {
+        .type_name                = "q8_kv256",
+        .blck_size                = QK8_KV256,
+        .type_size                = sizeof(block_q8_kv256),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q8_kv256,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q8_kv256_ref,
+    },
     [GGML_TYPE_Q8_1] = {
         .type_name                = "q8_1",
         .blck_size                = QK8_1,
@@ -1084,6 +1108,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
 
+    "QWEN38_PASCAL_FFN",
+    "QWEN38_PASCAL_GDN_IN",
+
     "UNARY",
 
     "MAP_CUSTOM1",
@@ -1100,7 +1127,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1199,6 +1226,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
 
+    "qwen38_pascal_ffn(x, residual)",
+    "qwen38_pascal_gdn_in(x)",
+
     "unary(x)",
 
     "map_custom(x)",
@@ -1215,7 +1245,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6492,6 +6522,49 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     return result;
 }
 
+// ggml_qwen38_pascal_ffn
+
+struct ggml_tensor * ggml_qwen38_pascal_ffn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * normalized,
+        struct ggml_tensor  * residual,
+        int32_t               layer) {
+    GGML_ASSERT(normalized->type == GGML_TYPE_F32);
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(normalized, residual));
+    GGML_ASSERT(ggml_is_contiguous(normalized));
+    GGML_ASSERT(ggml_is_contiguous(residual));
+    GGML_ASSERT(normalized->ne[0] == 5120);
+    GGML_ASSERT(ggml_nelements(normalized) == 5120);
+    GGML_ASSERT(layer >= 0);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, residual);
+    ggml_set_op_params_i32(result, 0, layer);
+    result->op     = GGML_OP_QWEN38_PASCAL_FFN;
+    result->src[0] = normalized;
+    result->src[1] = residual;
+    return result;
+}
+
+// ggml_qwen38_pascal_gdn_in
+
+struct ggml_tensor * ggml_qwen38_pascal_gdn_in(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * normalized,
+        int32_t               layer) {
+    GGML_ASSERT(normalized->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(normalized));
+    GGML_ASSERT(normalized->ne[0] == 5120);
+    GGML_ASSERT(ggml_nelements(normalized) == 5120);
+    GGML_ASSERT(layer >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 10240 + 6144);
+    ggml_set_op_params_i32(result, 0, layer);
+    result->op     = GGML_OP_QWEN38_PASCAL_GDN_IN;
+    result->src[0] = normalized;
+    return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 struct ggml_hash_set ggml_hash_set_new(size_t size) {
@@ -7970,6 +8043,18 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q5_0:    result = quantize_q5_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_1:    result = quantize_q5_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_0:    result = quantize_q8_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q8_KV64:
+            quantize_row_q8_kv64_ref(src + start, (block_q8_kv64 *) ((char *) dst + start_row * row_size), n);
+            result = nrows * row_size;
+            break;
+        case GGML_TYPE_Q8_KV128:
+            quantize_row_q8_kv128_ref(src + start, (block_q8_kv128 *) ((char *) dst + start_row * row_size), n);
+            result = nrows * row_size;
+            break;
+        case GGML_TYPE_Q8_KV256:
+            quantize_row_q8_kv256_ref(src + start, (block_q8_kv256 *) ((char *) dst + start_row * row_size), n);
+            result = nrows * row_size;
+            break;
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_K:    result = quantize_q2_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

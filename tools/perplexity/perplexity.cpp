@@ -1,6 +1,7 @@
 #include "arg.h"
 #include "common.h"
 #include "fit.h"
+#include "ggml-cuda.h"
 #include "log.h"
 #include "llama.h"
 
@@ -11,6 +12,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -36,6 +38,46 @@ struct results_log_softmax {
     float  logit;
     float  prob;
 };
+
+// Private diagnostic hook: exercise the same single-token Pascal FFN path used
+// by the hybrid server during teacher-forced perplexity runs.  The value is a
+// semicolon-separated list of layer:gate_up_path:down_path entries.
+static std::vector<int> qwen38_register_pascal_ffn_from_environment() {
+    const char * value = std::getenv("QWEN38_PASCAL_FFN_PACKS");
+    if (value == nullptr || value[0] == '\0') {
+        return {};
+    }
+
+    std::vector<int> layers;
+    std::stringstream entries(value);
+    std::string entry;
+    std::string enabled;
+    while (std::getline(entries, entry, ';')) {
+        const size_t first = entry.find(':');
+        const size_t second = first == std::string::npos ? std::string::npos : entry.find(':', first + 1);
+        if (first == std::string::npos || second == std::string::npos) {
+            throw std::runtime_error("invalid QWEN38_PASCAL_FFN_PACKS entry");
+        }
+        const int layer = std::stoi(entry.substr(0, first));
+        const std::string gate_up = entry.substr(first + 1, second - first - 1);
+        const std::string down = entry.substr(second + 1);
+        std::array<char, 512> error{};
+        if (!ggml_backend_cuda_qwen38_pascal_ffn_register(
+                0, layer, gate_up.c_str(), down.c_str(), error.data(), error.size())) {
+            throw std::runtime_error(
+                "failed to register Pascal FFN layer " + std::to_string(layer) + ": " + error.data());
+        }
+        layers.push_back(layer);
+        if (!enabled.empty()) {
+            enabled += ',';
+        }
+        enabled += std::to_string(layer);
+    }
+    if (setenv("QWEN38_PASCAL_FFN_LAYERS", enabled.c_str(), 1) != 0) {
+        throw std::runtime_error("failed to set QWEN38_PASCAL_FFN_LAYERS");
+    }
+    return layers;
+}
 
 static std::vector<float> softmax(const std::vector<float>& logits) {
     std::vector<float> probs(logits.size());
@@ -2044,6 +2086,7 @@ int llama_perplexity(int argc, char ** argv) {
     }
 
     llama_backend_init();
+    const std::vector<int> qwen38_pascal_ffn_layers = qwen38_register_pascal_ffn_from_environment();
     llama_numa_init(params.numa);
 
     // load the model and apply lora adapter, if any
@@ -2092,6 +2135,9 @@ int llama_perplexity(int argc, char ** argv) {
     llama_perf_context_print(ctx);
     common_memory_breakdown_print(ctx);
 
+    for (auto it = qwen38_pascal_ffn_layers.rbegin(); it != qwen38_pascal_ffn_layers.rend(); ++it) {
+        ggml_backend_cuda_qwen38_pascal_ffn_unregister(0, *it);
+    }
     llama_backend_free();
 
     return 0;

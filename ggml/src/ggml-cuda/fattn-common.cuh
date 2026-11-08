@@ -84,6 +84,74 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     return data;
 }
 
+// Scratch layout for the opt-in Qwen3.8 direct-Q8 MMA path.  It is half the
+// size of the usual F16 materialization: values remain source-exact Q8_KV256,
+// but rows are transposed from token-major [token][head] storage into
+// head-major [head][token] storage so the attention kernel can issue dense
+// asynchronous reads.
+static inline bool ggml_cuda_q8_kv256_is_head_major(const ggml_tensor * t) {
+    if (!t || t->type != GGML_TYPE_Q8_KV256 || t->ne[0] != 256) {
+        return false;
+    }
+    const size_t row = sizeof(block_q8_kv256);
+    return t->nb[1] == row && t->nb[2] >= size_t(t->ne[1])*row;
+}
+
+static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_q8_head_major_extra_data(
+        const ggml_tensor * dst) {
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    GGML_ASSERT(K != nullptr && V != nullptr);
+    GGML_ASSERT(K->type == GGML_TYPE_Q8_KV256 && V->type == GGML_TYPE_Q8_KV256);
+
+    ggml_cuda_flash_attn_ext_f16_extra_data data = {};
+    data.end = (uintptr_t) dst->data + ggml_nbytes(dst);
+
+    data.end = GGML_PAD(data.end, 128);
+    data.K   = data.end;
+    data.end += ggml_row_size(K->type, K->ne[0])*K->ne[1]*K->ne[2]*K->ne[3];
+
+    data.end = GGML_PAD(data.end, 128);
+    data.V   = data.end;
+    data.end += ggml_row_size(V->type, V->ne[0])*V->ne[1]*V->ne[2]*V->ne[3];
+
+    return data;
+}
+
+static __global__ void q8_kv256_pack_head_major(
+        const char * __restrict__ src, char * __restrict__ dst,
+        const int64_t n_token, const int64_t n_head, const int64_t n_seq,
+        const int64_t nb_token, const int64_t nb_head, const int64_t nb_seq) {
+    constexpr int shorts_per_row = sizeof(block_q8_kv256) / sizeof(uint16_t);
+    const int64_t idx = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t n_row = n_token*n_head*n_seq;
+    if (idx >= n_row*shorts_per_row) {
+        return;
+    }
+
+    const int64_t row = idx / shorts_per_row;
+    const int64_t ie  = idx - row*shorts_per_row;
+    const int64_t it  = row % n_token;
+    const int64_t ihs = row / n_token;
+    const int64_t ih  = ihs % n_head;
+    const int64_t is  = ihs / n_head;
+
+    const char * const src_el = src + is*nb_seq + ih*nb_head + it*nb_token + ie*sizeof(uint16_t);
+    reinterpret_cast<uint16_t *>(dst)[idx] = *reinterpret_cast<const uint16_t *>(src_el);
+}
+
+static inline void q8_kv256_pack_head_major_cuda(
+        const ggml_tensor * src, char * dst, cudaStream_t stream) {
+    constexpr int threads = 256;
+    constexpr int shorts_per_row = sizeof(block_q8_kv256) / sizeof(uint16_t);
+    const int64_t n = src->ne[1]*src->ne[2]*src->ne[3]*shorts_per_row;
+    q8_kv256_pack_head_major<<<(n + threads - 1)/threads, threads, 0, stream>>>(
+        static_cast<const char *>(src->data), dst,
+        src->ne[1], src->ne[2], src->ne[3], src->nb[1], src->nb[2], src->nb[3]);
+}
+
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
@@ -323,6 +391,54 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
         const float Q_d = Q_ds[k_KQ_0/nthreads].x;
 
         sum += vec_dot_q8_0_q8_1_impl<float, 1>(&v, &Q_q8[k_KQ_0/nthreads], K_q8_0[ib].d, Q_d);
+    }
+
+    return sum;
+}
+
+template<ggml_type type>
+struct fattn_q8_kv_traits;
+
+template<>
+struct fattn_q8_kv_traits<GGML_TYPE_Q8_KV64> {
+    using block_t = block_q8_kv64;
+    static constexpr int qk = QK8_KV64;
+};
+
+template<>
+struct fattn_q8_kv_traits<GGML_TYPE_Q8_KV128> {
+    using block_t = block_q8_kv128;
+    static constexpr int qk = QK8_KV128;
+};
+
+template<>
+struct fattn_q8_kv_traits<GGML_TYPE_Q8_KV256> {
+    using block_t = block_q8_kv256;
+    static constexpr int qk = QK8_KV256;
+};
+
+template <ggml_type type, int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_kv(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    using traits = fattn_q8_kv_traits<type>;
+    using block_t = typename traits::block_t;
+    constexpr int qi = traits::qk / sizeof(int);
+    const block_t * K = (const block_t *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int ib  = k_KQ / qi;
+        const int iqs = k_KQ % qi;
+
+        int v;
+        ggml_cuda_memcpy_1<sizeof(v), 2>(&v, K[ib].qs + sizeof(int)*iqs);
+        const float Q_d = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads].x;
+        sum += vec_dot_q8_0_q8_1_impl<float, 1>(&v, &Q_q8[k_KQ_0/nthreads], K[ib].d, Q_d);
     }
 
     return sum;
@@ -617,6 +733,43 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+template <ggml_type type, typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_q8_kv(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    using traits = fattn_q8_kv_traits<type>;
+    using block_t = typename traits::block_t;
+    constexpr int qk = traits::qk;
+    const block_t * x = (const block_t *) vx;
+
+    const int64_t ib  = i0 / qk;
+    const int     iqs = i0 % qk;
+
+    static_assert(ne % 2 == 0, "bad ne");
+    static_assert(qk % ne == 0, "bad qk");
+    int8_t qs[ne];
+    ggml_cuda_memcpy_1<ne, 2>(qs, x[ib].qs + iqs);
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same<T, half>::value) {
+        const half2 d = __half2half2(x[ib].d);
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = d * make_half2(qs[l0 + 0], qs[l0 + 1]);
+        }
+    } else
+#endif
+    if constexpr (std::is_same<T, float>::value) {
+        const float d = x[ib].d;
+
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * qs[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -631,6 +784,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_Q8_KV64 || type_K == GGML_TYPE_Q8_KV128 || type_K == GGML_TYPE_Q8_KV256) {
+        return vec_dot_fattn_vec_KQ_q8_kv<type_K, D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
     } else {
@@ -653,6 +808,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q5_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_Q8_KV64 || type_V == GGML_TYPE_Q8_KV128 || type_V == GGML_TYPE_Q8_KV256) {
+        return dequantize_V_q8_kv<type_V, T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
     } else {
@@ -972,7 +1129,8 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    const bool need_q8_head_major = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1002,7 +1160,33 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
+    static int qwen38_fattn_profile_calls = 0;
+    const char * qwen38_fattn_profile_value = getenv("QWEN38_CUDA_PROFILE_FATTN_STAGES");
+    const int qwen38_fattn_profile_max = qwen38_fattn_profile_value ? atoi(qwen38_fattn_profile_value) : 0;
+    const int qwen38_fattn_profile_call = qwen38_fattn_profile_calls++;
+    const bool qwen38_fattn_profile =
+        qwen38_fattn_profile_call < qwen38_fattn_profile_max &&
+        (need_f16_K || need_f16_V || need_q8_head_major);
+    cudaEvent_t qwen38_fattn_begin = nullptr;
+    cudaEvent_t qwen38_fattn_converted = nullptr;
+    cudaEvent_t qwen38_fattn_end = nullptr;
+    if (qwen38_fattn_profile) {
+        CUDA_CHECK(cudaEventCreate(&qwen38_fattn_begin));
+        CUDA_CHECK(cudaEventCreate(&qwen38_fattn_converted));
+        CUDA_CHECK(cudaEventCreate(&qwen38_fattn_end));
+        CUDA_CHECK(cudaEventRecord(qwen38_fattn_begin, main_stream));
+    }
+
+    const bool q8_persistent_head_major = need_q8_head_major &&
+        ggml_cuda_q8_kv256_is_head_major(K) &&
+        ggml_cuda_q8_kv256_is_head_major(V);
+    const bool q8_token_major_direct = need_q8_head_major &&
+        getenv("QWEN38_CUDA_DIRECT_Q8_STRIDED") &&
+        atoi(getenv("QWEN38_CUDA_DIRECT_Q8_STRIDED")) != 0;
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+        (q8_persistent_head_major || q8_token_major_direct) ?
+            ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, false, false) :
+        need_q8_head_major ? ggml_cuda_flash_attn_ext_get_q8_head_major_extra_data(KQV) :
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
@@ -1018,6 +1202,28 @@ void launch_fattn(
     size_t nb21 = V->nb[1];
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
+
+    if (need_q8_head_major) {
+        GGML_ASSERT(!need_f16_K && !need_f16_V);
+        GGML_ASSERT(K->type == GGML_TYPE_Q8_KV256 && V->type == GGML_TYPE_Q8_KV256);
+        if (!q8_persistent_head_major && !q8_token_major_direct) {
+            GGML_ASSERT(f16_extra.K != 0 && f16_extra.V != 0);
+
+            q8_kv256_pack_head_major_cuda(K, reinterpret_cast<char *>(f16_extra.K), main_stream);
+            q8_kv256_pack_head_major_cuda(V, reinterpret_cast<char *>(f16_extra.V), main_stream);
+            CUDA_CHECK(cudaGetLastError());
+
+            K_data = reinterpret_cast<const char *>(f16_extra.K);
+            nb11 = sizeof(block_q8_kv256);
+            nb12 = K->ne[1]*nb11;
+            nb13 = K->ne[2]*nb12;
+
+            V_data = reinterpret_cast<const char *>(f16_extra.V);
+            nb21 = sizeof(block_q8_kv256);
+            nb22 = V->ne[1]*nb21;
+            nb23 = V->ne[2]*nb22;
+        }
+    }
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
@@ -1081,6 +1287,10 @@ void launch_fattn(
             }
             V_data = (char *) V_f16;
         }
+    }
+
+    if (qwen38_fattn_profile) {
+        CUDA_CHECK(cudaEventRecord(qwen38_fattn_converted, main_stream));
     }
 
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
@@ -1271,4 +1481,25 @@ void launch_fattn(
             dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
     }
     CUDA_CHECK(cudaGetLastError());
+
+    if (qwen38_fattn_profile) {
+        CUDA_CHECK(cudaEventRecord(qwen38_fattn_end, main_stream));
+        CUDA_CHECK(cudaEventSynchronize(qwen38_fattn_end));
+
+        float convert_ms = 0.0f;
+        float attention_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&convert_ms, qwen38_fattn_begin, qwen38_fattn_converted));
+        CUDA_CHECK(cudaEventElapsedTime(&attention_ms, qwen38_fattn_converted, qwen38_fattn_end));
+        GGML_LOG_INFO(
+            "qwen38_fattn_stage_profile: call=%d device=%d q=%lld kv=%lld"
+            " type_k=%s type_v=%s convert_ms=%.6f attention_ms=%.6f total_ms=%.6f\n",
+            qwen38_fattn_profile_call, id,
+            static_cast<long long>(Q->ne[1]), static_cast<long long>(K->ne[1]),
+            ggml_type_name(K->type), ggml_type_name(V->type),
+            convert_ms, attention_ms, convert_ms + attention_ms);
+
+        CUDA_CHECK(cudaEventDestroy(qwen38_fattn_end));
+        CUDA_CHECK(cudaEventDestroy(qwen38_fattn_converted));
+        CUDA_CHECK(cudaEventDestroy(qwen38_fattn_begin));
+    }
 }

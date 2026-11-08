@@ -318,6 +318,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
 }
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const char * enabled = getenv("LLAMA_GDN_CHUNK_CUDA");
+    if (enabled && atoi(enabled) != 0 && ggml_cuda_gated_delta_net_chunk_supported(dst)) {
+        ggml_cuda_op_gated_delta_net_chunk(ctx, dst);
+        return;
+    }
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr);
 }
 

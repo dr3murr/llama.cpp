@@ -906,6 +906,11 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// Private Qwen3.8 phase-prefill extension.  State streams carry explicit
+// transformer layer ids and may restore a strict layer subset into a full
+// target context.
+#define LLAMA_STATE_SEQ_FLAGS_LAYER_SUBSET 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
@@ -1011,6 +1016,12 @@ extern "C" {
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
+
+    // Replace the graph evaluation callback for subsequent decodes.
+    LLAMA_API void llama_set_eval_callback(
+            struct llama_context * ctx,
+            ggml_backend_sched_eval_callback callback,
+            void * user_data);
 
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results

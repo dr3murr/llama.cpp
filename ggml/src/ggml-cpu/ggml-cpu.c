@@ -278,6 +278,24 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
 #endif
     },
+    [GGML_TYPE_Q8_KV64] = {
+        .from_float               = quantize_row_q8_kv64,
+        .vec_dot                  = ggml_vec_dot_q8_kv64_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q8_KV128] = {
+        .from_float               = quantize_row_q8_kv128,
+        .vec_dot                  = ggml_vec_dot_q8_kv128_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q8_KV256] = {
+        .from_float               = quantize_row_q8_kv256,
+        .vec_dot                  = ggml_vec_dot_q8_kv256_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q8_1] = {
         .from_float               = quantize_row_q8_1,
         .vec_dot_type             = GGML_TYPE_Q8_1,
@@ -2076,6 +2094,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_QWEN38_PASCAL_FFN:
+            {
+                GGML_ABORT("QWEN38_PASCAL_FFN is a private CUDA-only op");
+            } break;
+        case GGML_OP_QWEN38_PASCAL_GDN_IN:
+            {
+                GGML_ABORT("QWEN38_PASCAL_GDN_IN is a private CUDA-only op");
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2259,6 +2285,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_QWEN38_PASCAL_FFN:
+        case GGML_OP_QWEN38_PASCAL_GDN_IN:
             {
                 n_tasks = n_threads;
             } break;

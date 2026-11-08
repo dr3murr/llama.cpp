@@ -2969,7 +2969,8 @@ struct test_cpy : public test_case {
             return 0.0;
         }
         if (type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 || type_dst == GGML_TYPE_IQ4_NL ||
-            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
+            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0 ||
+            type_dst == GGML_TYPE_Q8_KV64 || type_dst == GGML_TYPE_Q8_KV128 || type_dst == GGML_TYPE_Q8_KV256) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-150,150], so it'll be
             // roughly (150*2.0 / 2^bits)^2, divided by the mean square value of the reference,
@@ -2982,7 +2983,8 @@ struct test_cpy : public test_case {
             if (type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1) {
                 err_estimate /= 2.0f;
             }
-            if (type_dst == GGML_TYPE_Q8_0) {
+            if (type_dst == GGML_TYPE_Q8_0 || type_dst == GGML_TYPE_Q8_KV64 ||
+                type_dst == GGML_TYPE_Q8_KV128 || type_dst == GGML_TYPE_Q8_KV256) {
                 err_estimate /= 8.0f;
             }
             err_estimate *= err_estimate;
@@ -8863,6 +8865,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // quant block count not a multiple of the kernel block size
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q4_0, {96, 1, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32, {96, 1, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q8_KV64, {256, 4, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q8_KV64, GGML_TYPE_F32, {256, 4, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q8_KV128, {256, 4, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q8_KV128, GGML_TYPE_F32, {256, 4, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q8_KV256, {256, 4, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q8_KV256, GGML_TYPE_F32, {256, 4, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}));
@@ -9953,6 +9961,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1025,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
+    for (ggml_type type_KV : {GGML_TYPE_Q8_KV64, GGML_TYPE_Q8_KV128, GGML_TYPE_Q8_KV256}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 1024,  1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 1024, 64, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+    }
+    for (int64_t kv : {256, 512}) {
+        for (int64_t q : {252, 256}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, q, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256));
+        }
+    }
+    for (int64_t q : {2, 3, 4, 5, 8, 9}) {
+        for (const std::array<int32_t, 4> & permute : {std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3}}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, q, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256, permute, false));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 252, true, false, 0, 0,
+                                                    GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256,
+                                                    {0, 2, 1, 3}));
+    // Exact Qwen3.8 production cache view: four 258-byte heads are interleaved
+    // per token, without the test harness's usual doubled backing row.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 252, true, false, 0, 0,
+                                                    GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256,
+                                                    {0, 2, 1, 3}, false));
+
+    // Qwen3.8-27B decode geometry: 24 query heads reuse four 256-wide KV heads.
+    // Keep both a quick and a native-context performance point so grouped-query
+    // cache-load regressions remain visible.
+    for (int64_t kv : {16384, 262144}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256));
+    }
+
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
@@ -10074,6 +10115,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 200, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  64, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 127, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
@@ -10128,6 +10171,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Qwen3.8-27B dense projection shapes.  Keep these in the generic backend
+    // harness so the private runtime can compare native Blackwell NVFP4 against
+    // the K-quant fallbacks at both single-token decode and prefill widths.
+    for (ggml_type type : {
+            GGML_TYPE_NVFP4,
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_Q5_K,
+            GGML_TYPE_Q6_K,
+            GGML_TYPE_F16,
+            GGML_TYPE_BF16,
+        }) {
+        for (int64_t n_tokens : {1, 128, 512}) {
+            // MLP gate/up and down projections.
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 17408, n_tokens,  5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  5120, n_tokens, 17408, {1, 1}, {1, 1}));
+
+            // Gated DeltaNet QKV, Z and output projections.
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 10240, n_tokens, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  6144, n_tokens, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  5120, n_tokens, 6144, {1, 1}, {1, 1}));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
@@ -10363,6 +10429,49 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  16384, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 262144, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256));
+    for (int64_t q : {2, 3, 4, 5, 8, 9}) {
+        for (const std::array<int32_t, 4> & permute : {std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3}}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},    512, q, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256, permute, false));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 262144, q, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256, permute, false));
+        }
+    }
+    for (int64_t q : {252, 256}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  16384, q, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 262144, q, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256));
+    }
+    // Qwen3.8 streamed-attention crossover points.  These intermediate native-
+    // shape cases decide when a P100-owned cache should remain on Pascal and
+    // when bounded P2P tiles plus SM120 partial attention become faster.
+    for (int64_t kv : {32768, 65536, 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 256, true, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256));
+    }
+    // Compare the ordinary token-major KV view with the head-major persistent
+    // layout used by the Qwen3.8 production manifest.  Sage/Flash kernel
+    // candidates must beat this exact Q8 baseline at the real 24:4 GQA shape,
+    // not a contiguous F16 proxy.
+    for (int64_t kv : {32768, 262144}) {
+        for (int64_t q : {128, 256, 512}) {
+            // Physical [head][token][Q8 row], matching the persistent RTX
+            // target cache rather than a doubled cache view or an interleaved
+            // token-major tensor.
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, q, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256,
+                                                            {0, 1, 2, 3}, false));
+            // Physical [token][head][Q8 row], used by the ordinary fallback
+            // cache and the P100 side.
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, q, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256,
+                                                            {0, 2, 1, 3}, false));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 262144, 252, true, false, 0, 0,
+                                                    GGML_PREC_F32, GGML_TYPE_Q8_KV256, GGML_TYPE_Q8_KV256,
+                                                    {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
@@ -10483,6 +10592,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, true)); // KDA
     // PP: n_seq_tokens=64,256 (prompt processing)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1));  // PP-64
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 125, 1)); // Qwen3.8 prefix before rollback tail
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024

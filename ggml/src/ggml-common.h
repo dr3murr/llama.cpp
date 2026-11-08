@@ -255,6 +255,27 @@ typedef struct {
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block size/padding");
 
+#define QK8_KV64 64
+typedef struct {
+    ggml_half d;
+    int8_t qs[QK8_KV64];
+} block_q8_kv64;
+static_assert(sizeof(block_q8_kv64) == sizeof(ggml_half) + QK8_KV64, "wrong q8_kv64 block size/padding");
+
+#define QK8_KV128 128
+typedef struct {
+    ggml_half d;
+    int8_t qs[QK8_KV128];
+} block_q8_kv128;
+static_assert(sizeof(block_q8_kv128) == sizeof(ggml_half) + QK8_KV128, "wrong q8_kv128 block size/padding");
+
+#define QK8_KV256 256
+typedef struct {
+    ggml_half d;
+    int8_t qs[QK8_KV256];
+} block_q8_kv256;
+static_assert(sizeof(block_q8_kv256) == sizeof(ggml_half) + QK8_KV256, "wrong q8_kv256 block size/padding");
+
 #define QK8_1 32
 typedef struct {
     GGML_EXTENSION union {

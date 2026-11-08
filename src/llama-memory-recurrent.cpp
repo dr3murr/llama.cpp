@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -27,6 +28,23 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   n_rs_seq,
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer();
+
+    // Experimental Qwen3.8 phase-specific prefill path.  When early layers are
+    // temporarily executed on the first later-layer device, keep their small
+    // recurrent/conv state there as well.  Otherwise every GDN layer bounces
+    // between the staged compute device and its normal decode device.
+    const char * prefill_state_layers_env = getenv("QWEN38_PREFILL_RTX_STATE_LAYERS");
+    const int32_t prefill_state_layers = prefill_state_layers_env ? atoi(prefill_state_layers_env) : 0;
+    const bool prefill_state_enabled = prefill_state_layers > 0 && prefill_state_layers < n_layer;
+    auto * prefill_state_dev = prefill_state_enabled ? model.dev_layer(prefill_state_layers) : nullptr;
+
+    if (prefill_state_layers_env && !prefill_state_enabled) {
+        LLAMA_LOG_WARN("%s: ignoring invalid QWEN38_PREFILL_RTX_STATE_LAYERS=%s (n_layer=%d)\n",
+                __func__, prefill_state_layers_env, n_layer);
+    } else if (prefill_state_enabled) {
+        LLAMA_LOG_INFO("%s: staging recurrent state for layers [0, %d) on %s\n",
+                __func__, prefill_state_layers, ggml_backend_dev_name(prefill_state_dev));
+    }
 
     head = 0;
     size = mem_size;
@@ -83,7 +101,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
         if (offload) {
-            auto * dev = model.dev_layer(i);
+            auto * dev = prefill_state_enabled && i < prefill_state_layers ? prefill_state_dev : model.dev_layer(i);
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
@@ -818,7 +836,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     io.write(&cell_count, sizeof(cell_count));
 
     state_write_meta(io, cell_ranges, seq_id);
-    state_write_data(io, cell_ranges_data);
+    state_write_data(io, cell_ranges_data, flags);
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -832,7 +850,7 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     res = res && state_read_meta(io, cell_count, seq_id);
 
     try {
-        res = res && state_read_data(io, cell_count);
+        res = res && state_read_data(io, cell_count, flags);
     } catch (...) {
         res = false;
     }
@@ -871,18 +889,33 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     }
 }
 
-void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
+void llama_memory_recurrent::state_write_data(
+        llama_io_write_i & io,
+        const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+        llama_state_seq_flags flags) const {
     const uint32_t s_trans = 0;
-    const uint32_t n_layer = hparams.n_layer();
+    const bool layer_subset = flags & LLAMA_STATE_SEQ_FLAGS_LAYER_SUBSET;
+    const uint32_t n_layer_total = hparams.n_layer();
+    uint32_t n_layer_stream = n_layer_total;
+    if (layer_subset) {
+        n_layer_stream = (uint32_t) std::count_if(r_l.begin(), r_l.end(),
+                [](const ggml_tensor * tensor) { return tensor != nullptr; });
+    }
+    const uint32_t n_layer_header = n_layer_stream |
+        (layer_subset ? UINT32_C(0x80000000) : 0);
 
     io.write(&s_trans, sizeof(s_trans));
-    io.write(&n_layer, sizeof(n_layer));
+    io.write(&n_layer_header, sizeof(n_layer_header));
 
     // Iterate and write all the R tensors first, each row is a cell
     // Get whole range at a time
-    for (uint32_t il = 0; il < n_layer; ++il) {
+    for (uint32_t il = 0; il < n_layer_total; ++il) {
         // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
         if (r_l[il] == nullptr) continue;
+
+        if (layer_subset) {
+            io.write(&il, sizeof(il));
+        }
 
         // Write R tensor type
         const int32_t r_type_i = (int32_t)r_l[il]->type;
@@ -902,9 +935,13 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
     }
 
     if (!s_trans) {
-        for (uint32_t il = 0; il < n_layer; ++il) {
+        for (uint32_t il = 0; il < n_layer_total; ++il) {
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
             if (s_l[il] == nullptr) continue;
+
+            if (layer_subset) {
+                io.write(&il, sizeof(il));
+            }
 
             // Write S tensor type
             const int32_t s_type_i = (int32_t)s_l[il]->type;
@@ -925,9 +962,13 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
     } else {
         // When S tensor is transposed, we also need the element size and get the element ranges from each row
         const uint32_t mem_size = size;
-        for (uint32_t il = 0; il < n_layer; ++il) {
+        for (uint32_t il = 0; il < n_layer_total; ++il) {
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
             if (s_l[il] == nullptr) continue;
+
+            if (layer_subset) {
+                io.write(&il, sizeof(il));
+            }
 
             const uint32_t n_embd_s = hparams.n_embd_s();
 
@@ -1051,13 +1092,20 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
     return true;
 }
 
-bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell_count) {
+bool llama_memory_recurrent::state_read_data(
+        llama_io_read_i & io,
+        uint32_t cell_count,
+        llama_state_seq_flags flags) {
     uint32_t s_trans;
     uint32_t n_layer;
     io.read(&s_trans, sizeof(s_trans));
     io.read(&n_layer, sizeof(n_layer));
 
-    if (n_layer != hparams.n_layer()) {
+    const bool layer_subset = n_layer & UINT32_C(0x80000000);
+    n_layer &= UINT32_C(0x7fffffff);
+
+    if ((!layer_subset && n_layer != hparams.n_layer()) ||
+            (layer_subset && (!(flags & LLAMA_STATE_SEQ_FLAGS_LAYER_SUBSET) || n_layer > hparams.n_layer()))) {
         LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, hparams.n_layer());
         return false;
     }
@@ -1071,9 +1119,19 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     }
 
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
-    for (uint32_t il = 0; il < n_layer; ++il) {
-        // skip null layers
-        if (r_l[il] == nullptr) continue;
+    const uint32_t n_read_layers = layer_subset ? n_layer : hparams.n_layer();
+    for (uint32_t i_layer = 0; i_layer < n_read_layers; ++i_layer) {
+        uint32_t il = i_layer;
+        if (layer_subset) {
+            io.read(&il, sizeof(il));
+        }
+        if (!layer_subset && r_l[il] == nullptr) {
+            continue;
+        }
+        if (il >= hparams.n_layer() || r_l[il] == nullptr) {
+            LLAMA_LOG_ERROR("%s: state contains unavailable recurrent R layer %u\n", __func__, il);
+            return false;
+        }
 
         // Read type of key
         int32_t r_type_i_ref;
@@ -1100,9 +1158,18 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     }
 
     if (!s_trans) {
-        for (uint32_t il = 0; il < n_layer; ++il) {
-            // skip null layers
-            if (s_l[il] == nullptr) continue;
+        for (uint32_t i_layer = 0; i_layer < n_read_layers; ++i_layer) {
+            uint32_t il = i_layer;
+            if (layer_subset) {
+                io.read(&il, sizeof(il));
+            }
+            if (!layer_subset && s_l[il] == nullptr) {
+                continue;
+            }
+            if (il >= hparams.n_layer() || s_l[il] == nullptr) {
+                LLAMA_LOG_ERROR("%s: state contains unavailable recurrent S layer %u\n", __func__, il);
+                return false;
+            }
 
             // Read type of value
             int32_t s_type_i_ref;
@@ -1130,9 +1197,18 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         }
     } else {
         // For each layer, read the values for each cell (transposed)
-        for (uint32_t il = 0; il < n_layer; ++il) {
-            // skip null layers
-            if (s_l[il] == nullptr) continue;
+        for (uint32_t i_layer = 0; i_layer < n_read_layers; ++i_layer) {
+            uint32_t il = i_layer;
+            if (layer_subset) {
+                io.read(&il, sizeof(il));
+            }
+            if (!layer_subset && s_l[il] == nullptr) {
+                continue;
+            }
+            if (il >= hparams.n_layer() || s_l[il] == nullptr) {
+                LLAMA_LOG_ERROR("%s: state contains unavailable recurrent transposed-S layer %u\n", __func__, il);
+                return false;
+            }
 
             const uint32_t n_embd_s = hparams.n_embd_s();
 

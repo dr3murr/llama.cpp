@@ -67,6 +67,19 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
+// notify implementations before a new prompt starts processing
+void common_speculative_prompt_start(common_speculative * spec, llama_seq_id seq_id);
+
+// Import target hidden rows produced by an out-of-band prompt prefill.  The
+// rows are ordered one per token at absolute positions [0, tokens.size()).
+// Returns true when a speculative implementation consumed the import.
+bool common_speculative_import_prompt_hidden(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        const llama_tokens & tokens,
+        const float * hidden,
+        int32_t n_embd);
+
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 

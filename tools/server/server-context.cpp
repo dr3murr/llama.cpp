@@ -10,6 +10,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "ggml-cuda.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -18,13 +19,19 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
-#include <utility>
 #include <fstream>
+#include <stdexcept>
+#include <system_error>
+#include <utility>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -36,6 +43,220 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static constexpr int QWEN38_SERVER_HIDDEN = 5120;
+
+struct qwen38_server_capture {
+    std::string tensor_name;
+    std::vector<float> * output = nullptr;
+    size_t row_offset = 0;
+    int32_t expected_rows = 0;
+    bool captured = false;
+    bool invalid = false;
+};
+
+static bool qwen38_server_capture_callback(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto & capture = *static_cast<qwen38_server_capture *>(user_data);
+    if (capture.tensor_name != ggml_get_name(tensor)) {
+        return false;
+    }
+    if (ask) {
+        return true;
+    }
+    if (tensor->type != GGML_TYPE_F32 || tensor->ne[0] != QWEN38_SERVER_HIDDEN ||
+            tensor->ne[1] != capture.expected_rows || !ggml_is_contiguous(tensor) ||
+            capture.output == nullptr) {
+        capture.invalid = true;
+        return true;
+    }
+
+    const size_t n = (size_t) capture.expected_rows * QWEN38_SERVER_HIDDEN;
+    ggml_backend_tensor_get(
+            tensor,
+            capture.output->data() + capture.row_offset * QWEN38_SERVER_HIDDEN,
+            0,
+            n * sizeof(float));
+    capture.captured = true;
+    return true;
+}
+
+class qwen38_scoped_env {
+public:
+    explicit qwen38_scoped_env(const char * key) : key_(key) {
+        if (const char * value = std::getenv(key)) {
+            had_value_ = true;
+            value_ = value;
+        }
+    }
+
+    ~qwen38_scoped_env() {
+        if (had_value_) {
+            setenv(key_.c_str(), value_.c_str(), 1);
+        } else {
+            unsetenv(key_.c_str());
+        }
+    }
+
+private:
+    std::string key_;
+    std::string value_;
+    bool had_value_ = false;
+};
+
+// A speculative slot snapshot is a small manifest plus generation-specific
+// target and draft sequence-state artifacts.  Keeping the large native state
+// files separate lets llama.cpp stream Q8 KV and FP32 recurrent tensors without
+// first allocating a multi-GiB host buffer.  The manifest is published last,
+// so a crash cannot make a partially written generation visible as complete.
+static constexpr uint32_t SERVER_SLOT_BUNDLE_MAGIC   = 0x42534c53; // "SLSB"
+static constexpr uint32_t SERVER_SLOT_BUNDLE_VERSION = 1;
+static constexpr uint64_t SERVER_SLOT_BUNDLE_SPEC_MAX = 64ull * 1024 * 1024;
+
+struct server_slot_bundle_manifest {
+    uint64_t generation  = 0;
+    uint64_t target_size = 0;
+    uint64_t draft_size  = 0;
+    std::vector<uint8_t> spec_state;
+};
+
+template<typename T>
+static void server_slot_bundle_write(std::ostream & out, const T & value) {
+    out.write(reinterpret_cast<const char *>(&value), sizeof(value));
+    if (!out) {
+        throw std::runtime_error("Failed to write slot snapshot manifest");
+    }
+}
+
+template<typename T>
+static void server_slot_bundle_read(std::istream & in, T & value) {
+    in.read(reinterpret_cast<char *>(&value), sizeof(value));
+    if (!in) {
+        throw std::runtime_error("Truncated slot snapshot manifest");
+    }
+}
+
+static std::string server_slot_bundle_artifact(
+        const std::string & filepath,
+        uint64_t            generation,
+        const char        * kind) {
+    return filepath + "." + std::to_string(generation) + "." + kind;
+}
+
+static bool server_slot_bundle_read_manifest(
+        const std::string          & filepath,
+        server_slot_bundle_manifest & manifest) {
+    std::ifstream in(filepath, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+
+    uint32_t magic = 0;
+    in.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+    if (!in || magic != SERVER_SLOT_BUNDLE_MAGIC) {
+        return false;
+    }
+
+    uint32_t version = 0;
+    uint64_t spec_size = 0;
+    server_slot_bundle_read(in, version);
+    server_slot_bundle_read(in, manifest.generation);
+    server_slot_bundle_read(in, manifest.target_size);
+    server_slot_bundle_read(in, manifest.draft_size);
+    server_slot_bundle_read(in, spec_size);
+
+    if (version != SERVER_SLOT_BUNDLE_VERSION) {
+        throw std::runtime_error("Unsupported slot snapshot manifest version");
+    }
+    if (manifest.generation == 0 || manifest.target_size == 0 || manifest.draft_size == 0) {
+        throw std::runtime_error("Invalid slot snapshot manifest sizes");
+    }
+    if (spec_size > SERVER_SLOT_BUNDLE_SPEC_MAX) {
+        throw std::runtime_error("Slot snapshot speculative state is unreasonably large");
+    }
+
+    manifest.spec_state.resize((size_t) spec_size);
+    if (spec_size > 0) {
+        in.read(reinterpret_cast<char *>(manifest.spec_state.data()), (std::streamsize) spec_size);
+        if (!in) {
+            throw std::runtime_error("Truncated slot snapshot speculative state");
+        }
+    }
+
+    char trailing = 0;
+    if (in.read(&trailing, 1)) {
+        throw std::runtime_error("Trailing data in slot snapshot manifest");
+    }
+
+    const std::string target = server_slot_bundle_artifact(filepath, manifest.generation, "target");
+    const std::string draft  = server_slot_bundle_artifact(filepath, manifest.generation, "draft");
+    std::error_code ec;
+    const uint64_t actual_target = std::filesystem::file_size(target, ec);
+    if (ec || actual_target != manifest.target_size) {
+        throw std::runtime_error("Missing or incomplete target slot snapshot artifact");
+    }
+    ec.clear();
+    const uint64_t actual_draft = std::filesystem::file_size(draft, ec);
+    if (ec || actual_draft != manifest.draft_size) {
+        throw std::runtime_error("Missing or incomplete draft slot snapshot artifact");
+    }
+
+    return true;
+}
+
+static size_t server_slot_bundle_write_manifest(
+        const std::string                  & filepath,
+        const server_slot_bundle_manifest & manifest) {
+    const std::string temporary = filepath + ".tmp";
+    {
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("Unable to create slot snapshot manifest");
+        }
+
+        const uint64_t spec_size = manifest.spec_state.size();
+        server_slot_bundle_write(out, SERVER_SLOT_BUNDLE_MAGIC);
+        server_slot_bundle_write(out, SERVER_SLOT_BUNDLE_VERSION);
+        server_slot_bundle_write(out, manifest.generation);
+        server_slot_bundle_write(out, manifest.target_size);
+        server_slot_bundle_write(out, manifest.draft_size);
+        server_slot_bundle_write(out, spec_size);
+        if (spec_size > 0) {
+            out.write(reinterpret_cast<const char *>(manifest.spec_state.data()), (std::streamsize) spec_size);
+            if (!out) {
+                throw std::runtime_error("Failed to write slot snapshot speculative state");
+            }
+        }
+        out.flush();
+        if (!out) {
+            throw std::runtime_error("Failed to flush slot snapshot manifest");
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(temporary, filepath, ec);
+    if (ec) {
+        // Windows does not replace an existing file with rename.  Linux takes
+        // the atomic path above; this fallback retains cross-platform support.
+        std::filesystem::remove(filepath, ec);
+        ec.clear();
+        std::filesystem::rename(temporary, filepath, ec);
+    }
+    if (ec) {
+        std::filesystem::remove(temporary);
+        throw std::runtime_error("Unable to publish slot snapshot manifest: " + ec.message());
+    }
+
+    return (size_t) std::filesystem::file_size(filepath);
+}
+
+static void server_slot_bundle_remove_artifacts(
+        const std::string                  & filepath,
+        const server_slot_bundle_manifest & manifest) {
+    std::error_code ec;
+    std::filesystem::remove(server_slot_bundle_artifact(filepath, manifest.generation, "target"), ec);
+    ec.clear();
+    std::filesystem::remove(server_slot_bundle_artifact(filepath, manifest.generation, "draft"), ec);
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -391,7 +612,7 @@ struct server_slot {
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
     // also we cannot split if the pooling would require any past tokens
-    // (MTP supports splitting — uses task->need_embd() not need_embd())
+    // (MTP supports splitting - uses task->need_embd() not need_embd())
     bool can_split() const {
         GGML_ASSERT(task);
 
@@ -443,8 +664,11 @@ struct server_slot {
 
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
-        //       also, need to leave space for 1 extra token to allow context shifts
-        int n_draft_max = n_ctx - prompt.n_tokens() - 2;
+        //       also, leave one position for a rejected draft's replacement and
+        //       one for the following target token.  Without the replacement
+        //       reserve, a rejection at the native-context boundary can make an
+        //       n_predict request return one token short.
+        int n_draft_max = n_ctx - prompt.n_tokens() - 3;
 
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
@@ -901,6 +1125,450 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+    }
+
+    bool qwen38_rebuild_runtime_contexts() {
+        spec.reset();
+        spec_init.reset();
+        ctx_dft = nullptr;
+        model_dft = nullptr;
+        params_base.speculative.draft.ctx_tgt = nullptr;
+        params_base.speculative.draft.ctx_dft = nullptr;
+
+        auto cparams = common_context_params_to_llama(params_base);
+        llama_context * context = llama_init_from_model(model_tgt, cparams);
+        if (context == nullptr) {
+            SRV_ERR("%s", "staged prefill: failed to recreate production target context\n");
+            return false;
+        }
+        llama_init->replace_context(context);
+        ctx_tgt = context;
+
+        const bool has_draft = params_base.speculative.has_dft();
+        const bool spec_mtp = std::find(
+                params_base.speculative.types.begin(),
+                params_base.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        if (has_draft || spec_mtp) {
+            common_params params_dft = common_base_params_to_speculative(params_base);
+            spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+            model_dft = spec_init->model();
+            ctx_dft = spec_init->context();
+            if ((has_draft && model_dft == nullptr) || ctx_dft == nullptr) {
+                SRV_ERR("%s", "staged prefill: failed to recreate production draft context\n");
+                return false;
+            }
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            params_base.speculative.draft.ctx_dft = ctx_dft;
+        }
+
+        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+        ctx_dft_seq_rm_type = ctx_dft ? common_context_can_seq_rm(ctx_dft) : COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            try {
+                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+            } catch (const std::exception & error) {
+                SRV_ERR("staged prefill: failed to recreate speculative runtime: %s\n", error.what());
+                return false;
+            }
+        }
+
+        for (auto & cur : slots) {
+            cur.ctx_tgt = ctx_tgt;
+            cur.ctx_dft = ctx_dft;
+            cur.mem.init(ctx_tgt, ctx_dft);
+            cur.spec = spec.get();
+        }
+        return true;
+    }
+
+    bool qwen38_layer_major_eligible(const server_slot & slot, int n_past) const {
+        const char * enabled = std::getenv("QWEN38_SERVER_LAYER_MAJOR_PREFILL");
+        const char * force_ordinary = std::getenv("QWEN38_SERVER_LAYER_MAJOR_FORCE_ORDINARY");
+        if (enabled == nullptr || std::atoi(enabled) == 0 || params_base.n_parallel != 1 ||
+                (force_ordinary && std::atoi(force_ordinary) != 0) ||
+                slot.id != 0 || slot.task == nullptr ||
+                slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.task->tokens.has_mtmd ||
+                !params_base.lora_adapters.empty()) {
+            return false;
+        }
+
+        const int n_tokens = slot.task->n_tokens();
+        const int n_min = std::getenv("QWEN38_SERVER_LAYER_MAJOR_MIN_TOKENS") ?
+                std::max(2, std::atoi(std::getenv("QWEN38_SERVER_LAYER_MAJOR_MIN_TOKENS"))) : 2048;
+        const int n_max = std::getenv("QWEN38_SERVER_LAYER_MAJOR_MAX_TOKENS") ?
+                std::max(0, std::atoi(std::getenv("QWEN38_SERVER_LAYER_MAJOR_MAX_TOKENS"))) : 32768;
+        const int n_uncached = n_tokens - n_past;
+        const int n_uncached_min = std::getenv("QWEN38_SERVER_LAYER_MAJOR_MIN_UNCACHED_TOKENS") ?
+                std::max(1, std::atoi(std::getenv("QWEN38_SERVER_LAYER_MAJOR_MIN_UNCACHED_TOKENS"))) : 2048;
+
+        // Rebuilding the whole prompt is worthwhile only when the uncached
+        // suffix is large enough to repay discarding the ordinary KV reuse.
+        return n_tokens >= n_min && n_tokens <= n_max &&
+                n_uncached >= n_uncached_min && n_uncached * 4 >= n_tokens;
+    }
+
+    bool qwen38_run_layer_major_prefill(server_slot & slot) {
+        const llama_tokens input = slot.task->tokens.get_text_tokens();
+        if (input.size() < 2 || input.size() != slot.task->tokens.size()) {
+            return false;
+        }
+
+        const int32_t n_tokens = (int32_t) input.size() - 1;
+        const int32_t chunk = std::getenv("QWEN38_SERVER_LAYER_MAJOR_CHUNK") ?
+                std::max(1, std::atoi(std::getenv("QWEN38_SERVER_LAYER_MAJOR_CHUNK"))) : 512;
+        const int32_t all_rtx_max = std::getenv("QWEN38_SERVER_LAYER_MAJOR_ALL_RTX_MAX_TOKENS") ?
+                std::max(2, std::atoi(std::getenv("QWEN38_SERVER_LAYER_MAJOR_ALL_RTX_MAX_TOKENS"))) : 32768;
+        const char * force_bounded_env = std::getenv("QWEN38_SERVER_LAYER_MAJOR_FORCE_BOUNDED");
+        const bool memory_bounded = n_tokens + 1 > all_rtx_max ||
+                (force_bounded_env && std::atoi(force_bounded_env) != 0);
+        const int32_t stage_layer_end = memory_bounded ? 24 : 64;
+        const llama_state_seq_flags state_flags = memory_bounded ?
+                LLAMA_STATE_SEQ_FLAGS_LAYER_SUBSET : LLAMA_STATE_SEQ_FLAGS_NONE;
+        const size_t n_elements = (size_t) n_tokens * QWEN38_SERVER_HIDDEN;
+        const int64_t started = ggml_time_us();
+
+        qwen38_scoped_env e_stage_weights("QWEN38_PREFILL_RTX_STAGE_WEIGHTS");
+        qwen38_scoped_env e_stage_device("QWEN38_PREFILL_RTX_STAGE_DEVICE");
+        qwen38_scoped_env e_stage_cache("QWEN38_PREFILL_RTX_LAYER_MAJOR_STAGE_CACHE");
+        qwen38_scoped_env e_graph_layers("QWEN38_PREFILL_RTX_GRAPH_LAYERS");
+        qwen38_scoped_env e_state_layers("QWEN38_PREFILL_RTX_STATE_LAYERS");
+        qwen38_scoped_env e_graph_min("QWEN38_PREFILL_RTX_GRAPH_MIN_TOKENS");
+        qwen38_scoped_env e_kv_layer("QWEN38_PREFILL_RTX_KV_LAYER");
+        qwen38_scoped_env e_kv_layers("QWEN38_PREFILL_RTX_KV_LAYERS");
+        qwen38_scoped_env e_diag_start("QWEN38_DIAGNOSTIC_LAYER_START");
+        qwen38_scoped_env e_diag_end("QWEN38_DIAGNOSTIC_LAYER_END");
+        qwen38_scoped_env e_diag_head("QWEN38_DIAGNOSTIC_OUTPUT_HEAD");
+        qwen38_scoped_env e_memory_start("QWEN38_MEMORY_LAYER_START");
+        qwen38_scoped_env e_memory_end("QWEN38_MEMORY_LAYER_END");
+
+        spec.reset();
+        spec_init.reset();
+        ctx_dft = nullptr;
+        model_dft = nullptr;
+        params_base.speculative.draft.ctx_tgt = nullptr;
+        params_base.speculative.draft.ctx_dft = nullptr;
+        llama_init->replace_context(nullptr);
+        ctx_tgt = nullptr;
+        for (auto & cur : slots) {
+            cur.ctx_tgt = nullptr;
+            cur.ctx_dft = nullptr;
+            cur.spec = nullptr;
+        }
+
+        setenv("QWEN38_PREFILL_RTX_STAGE_WEIGHTS", "1", 1);
+        setenv("QWEN38_PREFILL_RTX_STAGE_DEVICE", "1", 1);
+        setenv("QWEN38_PREFILL_RTX_LAYER_MAJOR_STAGE_CACHE", "1", 1);
+        setenv("QWEN38_PREFILL_RTX_GRAPH_LAYERS", "63", 1);
+        setenv("QWEN38_PREFILL_RTX_STATE_LAYERS",
+                std::to_string(memory_bounded ? stage_layer_end : 63).c_str(), 1);
+        setenv("QWEN38_PREFILL_RTX_GRAPH_MIN_TOKENS", "1", 1);
+        unsetenv("QWEN38_PREFILL_RTX_KV_LAYER");
+        setenv("QWEN38_PREFILL_RTX_KV_LAYERS", std::to_string(stage_layer_end).c_str(), 1);
+        unsetenv("QWEN38_DIAGNOSTIC_OUTPUT_HEAD");
+        if (memory_bounded) {
+            setenv("QWEN38_MEMORY_LAYER_START", "0", 1);
+            setenv("QWEN38_MEMORY_LAYER_END", std::to_string(stage_layer_end).c_str(), 1);
+        } else {
+            unsetenv("QWEN38_MEMORY_LAYER_START");
+            unsetenv("QWEN38_MEMORY_LAYER_END");
+        }
+
+        llama_context * stage_ctx = nullptr;
+        llama_batch token_batch = {};
+        llama_batch hidden_batch = {};
+        bool token_batch_initialized = false;
+        bool hidden_batch_initialized = false;
+        std::vector<uint8_t> state;
+        std::vector<float> current;
+        std::vector<float> next;
+        std::string failure;
+
+        try {
+            qwen38_server_capture capture;
+            auto cparams = common_context_params_to_llama(params_base);
+            cparams.n_ctx = (uint32_t) n_tokens;
+            cparams.n_batch = (uint32_t) chunk;
+            cparams.n_ubatch = (uint32_t) chunk;
+            cparams.n_seq_max = 1;
+            cparams.n_outputs_max = (uint32_t) chunk;
+            cparams.n_outputs_max_per_seq = (uint32_t) chunk;
+            cparams.cb_eval = qwen38_server_capture_callback;
+            cparams.cb_eval_user_data = &capture;
+
+            setenv("QWEN38_DIAGNOSTIC_LAYER_START", "0", 1);
+            setenv("QWEN38_DIAGNOSTIC_LAYER_END", "1", 1);
+            stage_ctx = llama_init_from_model(model_tgt, cparams);
+            if (stage_ctx == nullptr) {
+                throw std::runtime_error("failed to create temporary staging context");
+            }
+
+            token_batch = llama_batch_init(chunk, 0, 1);
+            token_batch_initialized = true;
+            std::free(token_batch.pos);
+            token_batch.pos = static_cast<llama_pos *>(
+                    std::malloc((size_t) chunk * 4 * sizeof(llama_pos)));
+            hidden_batch = llama_batch_init(chunk, QWEN38_SERVER_HIDDEN, 1);
+            hidden_batch_initialized = true;
+            std::free(hidden_batch.pos);
+            hidden_batch.pos = static_cast<llama_pos *>(
+                    std::malloc((size_t) chunk * 4 * sizeof(llama_pos)));
+            if (token_batch.pos == nullptr || hidden_batch.pos == nullptr) {
+                throw std::runtime_error("failed to allocate staged M-RoPE positions");
+            }
+
+            current.resize(n_elements);
+            next.resize(n_elements);
+
+            auto run_layer = [&](int32_t layer, const float * input_hidden) {
+                const std::string layer_start = std::to_string(layer);
+                const std::string layer_end = std::to_string(layer + 1);
+                setenv("QWEN38_DIAGNOSTIC_LAYER_START", layer_start.c_str(), 1);
+                setenv("QWEN38_DIAGNOSTIC_LAYER_END", layer_end.c_str(), 1);
+                capture.tensor_name = "diagnostic_layer_out-" + layer_end;
+                capture.output = &next;
+
+                for (int32_t offset = 0; offset < n_tokens; offset += chunk) {
+                    const int32_t count = std::min(chunk, n_tokens - offset);
+                    llama_batch & batch_cur = layer == 0 ? token_batch : hidden_batch;
+                    batch_cur.n_tokens = count;
+                    if (layer > 0) {
+                        std::memcpy(
+                                batch_cur.embd,
+                                input_hidden + (size_t) offset * QWEN38_SERVER_HIDDEN,
+                                (size_t) count * QWEN38_SERVER_HIDDEN * sizeof(float));
+                    }
+                    for (int32_t i = 0; i < count; ++i) {
+                        const int32_t pos = offset + i;
+                        if (layer == 0) {
+                            batch_cur.token[i] = input[pos];
+                        }
+                        batch_cur.pos[i] = pos;
+                        batch_cur.pos[count + i] = pos;
+                        batch_cur.pos[2 * count + i] = pos;
+                        batch_cur.pos[3 * count + i] = 0;
+                        batch_cur.n_seq_id[i] = 1;
+                        batch_cur.seq_id[i][0] = 0;
+                        batch_cur.logits[i] = 0;
+                    }
+
+                    capture.row_offset = (size_t) offset;
+                    capture.expected_rows = count;
+                    capture.captured = false;
+                    capture.invalid = false;
+                    int32_t rc = 0;
+                    queue_tasks.yield_to_queue([&]() {
+                        rc = llama_decode(stage_ctx, batch_cur);
+                    });
+                    if (!slot.is_processing()) {
+                        throw std::runtime_error("request cancelled during staged prefill");
+                    }
+                    if (rc != 0 || !capture.captured || capture.invalid) {
+                        throw std::runtime_error(
+                                "layer " + std::to_string(layer) + " failed at position " +
+                                std::to_string(offset) + " with status " + std::to_string(rc));
+                    }
+                }
+            };
+
+            run_layer(0, nullptr);
+            current.swap(next);
+            for (int32_t layer = 1; layer < stage_layer_end; ++layer) {
+                llama_synchronize(stage_ctx);
+                ggml_backend_cuda_qwen38_layer_major_stage_clear();
+                if (!llama_memory_seq_rm(llama_get_memory(stage_ctx), 0, -1, -1)) {
+                    throw std::runtime_error("failed to reset staged memory metadata");
+                }
+                run_layer(layer, current.data());
+                current.swap(next);
+            }
+            llama_synchronize(stage_ctx);
+
+            const size_t state_size = llama_state_seq_get_size_ext(
+                    stage_ctx, 0, state_flags);
+            state.resize(state_size);
+            const size_t state_written = llama_state_seq_get_data_ext(
+                    stage_ctx, state.data(), state.size(), 0, state_flags);
+            if (state_written != state.size()) {
+                throw std::runtime_error("failed to capture canonical staged state");
+            }
+        } catch (const std::exception & error) {
+            failure = error.what();
+        }
+
+        if (hidden_batch_initialized) {
+            llama_batch_free(hidden_batch);
+        }
+        if (token_batch_initialized) {
+            llama_batch_free(token_batch);
+        }
+        if (stage_ctx) {
+            llama_free(stage_ctx);
+        }
+        ggml_backend_cuda_qwen38_layer_major_stage_clear();
+        unsetenv("QWEN38_PREFILL_RTX_STAGE_WEIGHTS");
+        unsetenv("QWEN38_PREFILL_RTX_STAGE_DEVICE");
+        unsetenv("QWEN38_PREFILL_RTX_LAYER_MAJOR_STAGE_CACHE");
+        unsetenv("QWEN38_PREFILL_RTX_GRAPH_LAYERS");
+        unsetenv("QWEN38_PREFILL_RTX_STATE_LAYERS");
+        unsetenv("QWEN38_PREFILL_RTX_GRAPH_MIN_TOKENS");
+        unsetenv("QWEN38_PREFILL_RTX_KV_LAYER");
+        unsetenv("QWEN38_PREFILL_RTX_KV_LAYERS");
+        unsetenv("QWEN38_DIAGNOSTIC_LAYER_START");
+        unsetenv("QWEN38_DIAGNOSTIC_LAYER_END");
+        unsetenv("QWEN38_DIAGNOSTIC_OUTPUT_HEAD");
+        unsetenv("QWEN38_MEMORY_LAYER_START");
+        unsetenv("QWEN38_MEMORY_LAYER_END");
+
+        if (!qwen38_rebuild_runtime_contexts()) {
+            throw std::runtime_error("staged prefill could not restore the production runtime");
+        }
+
+        if (!failure.empty()) {
+            slot.prompt.tokens.clear();
+            SRV_WRN("staged prefill failed, using ordinary prefill: %s\n", failure.c_str());
+            return false;
+        }
+
+        const size_t captured_state_size = state.size();
+        const size_t state_read = llama_state_seq_set_data_ext(
+                ctx_tgt, state.data(), state.size(), slot.id, state_flags);
+        if (state_read != state.size()) {
+            slot.prompt.tokens.clear();
+            llama_memory_clear(llama_get_memory(ctx_tgt), true);
+            SRV_WRN("staged prefill state restore consumed %zu of %zu bytes; using ordinary prefill\n",
+                    state_read, state.size());
+            return false;
+        }
+        state.clear();
+        state.shrink_to_fit();
+
+        if (memory_bounded) {
+            qwen38_server_capture capture;
+            llama_batch suffix_batch = {};
+            bool suffix_batch_initialized = false;
+            setenv("QWEN38_PREFILL_RTX_LAYER_MAJOR_STAGE_CACHE", "1", 1);
+            setenv("QWEN38_PREFILL_RTX_GRAPH_LAYERS", "24", 1);
+            setenv("QWEN38_PREFILL_RTX_GRAPH_MIN_TOKENS", "1", 1);
+            unsetenv("QWEN38_PREFILL_RTX_STAGE_WEIGHTS");
+            unsetenv("QWEN38_PREFILL_RTX_STAGE_DEVICE");
+            llama_set_eval_callback(ctx_tgt, qwen38_server_capture_callback, &capture);
+
+            try {
+                suffix_batch = llama_batch_init(chunk, QWEN38_SERVER_HIDDEN, 1);
+                suffix_batch_initialized = true;
+                std::free(suffix_batch.pos);
+                suffix_batch.pos = static_cast<llama_pos *>(
+                        std::malloc((size_t) chunk * 4 * sizeof(llama_pos)));
+                if (suffix_batch.pos == nullptr) {
+                    throw std::runtime_error("failed to allocate bounded-suffix M-RoPE positions");
+                }
+
+                auto run_suffix_layer = [&](int32_t layer) {
+                    const std::string layer_start = std::to_string(layer);
+                    const std::string layer_end = std::to_string(layer + 1);
+                    setenv("QWEN38_DIAGNOSTIC_LAYER_START", layer_start.c_str(), 1);
+                    setenv("QWEN38_DIAGNOSTIC_LAYER_END", layer_end.c_str(), 1);
+                    capture.tensor_name = "diagnostic_layer_out-" + layer_end;
+                    capture.output = &next;
+
+                    for (int32_t offset = 0; offset < n_tokens; offset += chunk) {
+                        const int32_t count = std::min(chunk, n_tokens - offset);
+                        suffix_batch.n_tokens = count;
+                        std::memcpy(
+                                suffix_batch.embd,
+                                current.data() + (size_t) offset * QWEN38_SERVER_HIDDEN,
+                                (size_t) count * QWEN38_SERVER_HIDDEN * sizeof(float));
+                        for (int32_t i = 0; i < count; ++i) {
+                            const int32_t pos = offset + i;
+                            suffix_batch.pos[i] = pos;
+                            suffix_batch.pos[count + i] = pos;
+                            suffix_batch.pos[2 * count + i] = pos;
+                            suffix_batch.pos[3 * count + i] = 0;
+                            suffix_batch.n_seq_id[i] = 1;
+                            suffix_batch.seq_id[i][0] = slot.id;
+                            suffix_batch.logits[i] = 0;
+                        }
+
+                        capture.row_offset = (size_t) offset;
+                        capture.expected_rows = count;
+                        capture.captured = false;
+                        capture.invalid = false;
+                        int32_t rc = 0;
+                        queue_tasks.yield_to_queue([&]() {
+                            rc = llama_decode(ctx_tgt, suffix_batch);
+                        });
+                        if (!slot.is_processing()) {
+                            throw std::runtime_error("request cancelled during bounded suffix prefill");
+                        }
+                        if (rc != 0 || !capture.captured || capture.invalid) {
+                            throw std::runtime_error(
+                                    "bounded suffix layer " + std::to_string(layer) +
+                                    " failed at position " + std::to_string(offset) +
+                                    " with status " + std::to_string(rc));
+                        }
+                    }
+                };
+
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1)) {
+                    throw std::runtime_error("failed to reset bounded target memory metadata");
+                }
+                for (int32_t layer = stage_layer_end; layer < 64; ++layer) {
+                    if (layer != stage_layer_end) {
+                        llama_synchronize(ctx_tgt);
+                        ggml_backend_cuda_qwen38_layer_major_stage_clear();
+                        if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1)) {
+                            throw std::runtime_error("failed to reset bounded suffix memory metadata");
+                        }
+                    }
+                    run_suffix_layer(layer);
+                    current.swap(next);
+                }
+                llama_synchronize(ctx_tgt);
+            } catch (const std::exception & error) {
+                failure = error.what();
+            }
+
+            llama_set_eval_callback(ctx_tgt, nullptr, nullptr);
+            if (suffix_batch_initialized) {
+                llama_batch_free(suffix_batch);
+            }
+            ggml_backend_cuda_qwen38_layer_major_stage_clear();
+            unsetenv("QWEN38_PREFILL_RTX_LAYER_MAJOR_STAGE_CACHE");
+            unsetenv("QWEN38_PREFILL_RTX_GRAPH_LAYERS");
+            unsetenv("QWEN38_PREFILL_RTX_GRAPH_MIN_TOKENS");
+            unsetenv("QWEN38_DIAGNOSTIC_LAYER_START");
+            unsetenv("QWEN38_DIAGNOSTIC_LAYER_END");
+
+            if (!failure.empty()) {
+                slot.prompt.tokens.clear();
+                llama_memory_clear(llama_get_memory(ctx_tgt), true);
+                SRV_WRN("bounded staged prefill failed, using ordinary prefill: %s\n", failure.c_str());
+                return false;
+            }
+        }
+
+        llama_tokens staged_tokens(input.begin(), input.end() - 1);
+        if (spec) {
+            common_speculative_prompt_start(spec.get(), slot.id);
+            if (!common_speculative_import_prompt_hidden(
+                    spec.get(), slot.id, staged_tokens, current.data(), QWEN38_SERVER_HIDDEN)) {
+                SRV_WRN("%s", "staged prefill: MTP hidden import was not consumed\n");
+            }
+        }
+
+        slot.prompt.tokens.clear();
+        for (llama_token token : staged_tokens) {
+            slot.prompt.tokens.push_back(token);
+        }
+        slot.stats.n_prompt_processed = staged_tokens.size();
+        metrics.add_prompt(staged_tokens.size(), ggml_time_us() - started);
+
+        const double elapsed = (ggml_time_us() - started) / 1e6;
+        SRV_INF("%s staged prefill restored %d positions in %.3f s (%.2f tok/s), state %.2f MiB\n",
+                memory_bounded ? "memory-bounded" : "all-RTX",
+                n_tokens, elapsed, n_tokens / elapsed, captured_state_size / 1048576.0);
+        return true;
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1612,6 +2280,13 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (task.params.prefill_only && task.params.n_predict != 0) {
+            send_error(task,
+                       "prefill_only requires an explicit n_predict of 0",
+                       ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2446,20 +3121,96 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    std::vector<char> packed;
+                    size_t nwrite = 0;
+                    std::string target_temporary;
+                    std::string draft_temporary;
+                    std::string target_artifact;
+                    std::string draft_artifact;
                     try {
-                        packed = slot->prompt.tokens.serialize();
-                    } catch (const std::exception & err) {
-                        send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
-                        break;
-                    }
+                        const std::vector<char> packed = slot->prompt.tokens.serialize();
+                        GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+                        const llama_token * packed_tokens = reinterpret_cast<const llama_token *>(packed.data());
+                        const size_t n_packed = packed.size() / sizeof(llama_token);
 
-                    GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
-                    if (nwrite == 0) {
-                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+                        if (ctx_dft == nullptr) {
+                            nwrite = llama_state_seq_save_file(
+                                ctx_tgt, filepath.c_str(), slot->id, packed_tokens, n_packed);
+                            if (nwrite == 0) {
+                                throw std::runtime_error("Unable to save target slot state");
+                            }
+                        } else {
+                            server_slot_bundle_manifest old_manifest;
+                            bool have_old_manifest = false;
+                            try {
+                                have_old_manifest = server_slot_bundle_read_manifest(filepath, old_manifest);
+                            } catch (const std::exception &) {
+                                // A broken previous generation must not prevent replacement.
+                            }
+
+                            server_slot_bundle_manifest manifest;
+                            manifest.generation = (uint64_t) ggml_time_us();
+                            common_speculative_get_state(spec.get(), slot->id, manifest.spec_state);
+
+                            target_artifact = server_slot_bundle_artifact(filepath, manifest.generation, "target");
+                            draft_artifact  = server_slot_bundle_artifact(filepath, manifest.generation, "draft");
+                            target_temporary = target_artifact + ".tmp";
+                            draft_temporary  = draft_artifact + ".tmp";
+
+                            std::error_code ec;
+                            std::filesystem::remove(target_temporary, ec);
+                            ec.clear();
+                            std::filesystem::remove(draft_temporary, ec);
+
+                            manifest.target_size = llama_state_seq_save_file(
+                                ctx_tgt, target_temporary.c_str(), slot->id, packed_tokens, n_packed);
+                            if (manifest.target_size == 0) {
+                                throw std::runtime_error("Unable to save target slot snapshot artifact");
+                            }
+
+                            manifest.draft_size = llama_state_seq_save_file(
+                                ctx_dft, draft_temporary.c_str(), slot->id, packed_tokens, n_packed);
+                            if (manifest.draft_size == 0) {
+                                throw std::runtime_error("Unable to save draft slot snapshot artifact");
+                            }
+
+                            ec.clear();
+                            std::filesystem::rename(target_temporary, target_artifact, ec);
+                            if (ec) {
+                                throw std::runtime_error("Unable to publish target slot snapshot artifact: " + ec.message());
+                            }
+                            ec.clear();
+                            std::filesystem::rename(draft_temporary, draft_artifact, ec);
+                            if (ec) {
+                                throw std::runtime_error("Unable to publish draft slot snapshot artifact: " + ec.message());
+                            }
+
+                            const size_t manifest_size = server_slot_bundle_write_manifest(filepath, manifest);
+                            nwrite = (size_t) manifest.target_size + (size_t) manifest.draft_size + manifest_size;
+
+                            if (have_old_manifest && old_manifest.generation != manifest.generation) {
+                                server_slot_bundle_remove_artifacts(filepath, old_manifest);
+                            }
+                        }
+                    } catch (const std::exception & err) {
+                        std::error_code ec;
+                        if (!target_temporary.empty()) {
+                            std::filesystem::remove(target_temporary, ec);
+                        }
+                        ec.clear();
+                        if (!draft_temporary.empty()) {
+                            std::filesystem::remove(draft_temporary, ec);
+                        }
+                        ec.clear();
+                        if (!target_artifact.empty()) {
+                            std::filesystem::remove(target_artifact, ec);
+                        }
+                        ec.clear();
+                        if (!draft_artifact.empty()) {
+                            std::filesystem::remove(draft_artifact, ec);
+                        }
+                        ec.clear();
+                        std::filesystem::remove(filepath + ".tmp", ec);
+                        send_error(task, std::string("Unable to save slot: ") + err.what(), ERROR_TYPE_SERVER);
                         break;
                     }
 
@@ -2498,17 +3249,57 @@ private:
 
                     size_t nread = 0;
                     try {
+                        server_slot_bundle_manifest manifest;
+                        const bool is_bundle = server_slot_bundle_read_manifest(filepath, manifest);
+                        if (!is_bundle && ctx_dft != nullptr) {
+                            throw std::runtime_error(
+                                "Target-only slot files cannot safely restore with speculative decoding enabled");
+                        }
+
+                        const std::string target_path = is_bundle
+                            ? server_slot_bundle_artifact(filepath, manifest.generation, "target")
+                            : filepath;
+
                         size_t n_packed = 0;
                         llama_tokens packed;
-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
+                        nread = llama_state_seq_load_file(ctx_tgt, target_path.c_str(), slot->id, nullptr, 0, &n_packed);
                         if (nread != 0) {
                             packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+                            nread = llama_state_seq_load_file(
+                                ctx_tgt, target_path.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
                         }
                         if (nread == 0) {
                             throw std::runtime_error("No available space in KV cache or invalid slot save file");
                         }
                         packed.resize(n_packed);
+
+                        if (is_bundle) {
+                            if (ctx_dft == nullptr) {
+                                throw std::runtime_error("Slot snapshot contains draft state but no draft context is loaded");
+                            }
+
+                            const std::string draft_path =
+                                server_slot_bundle_artifact(filepath, manifest.generation, "draft");
+                            size_t n_packed_draft = 0;
+                            size_t nread_draft = llama_state_seq_load_file(
+                                ctx_dft, draft_path.c_str(), slot->id, nullptr, 0, &n_packed_draft);
+                            llama_tokens packed_draft(std::max<size_t>(1, n_packed_draft));
+                            if (nread_draft != 0) {
+                                nread_draft = llama_state_seq_load_file(
+                                    ctx_dft, draft_path.c_str(), slot->id,
+                                    packed_draft.data(), packed_draft.size(), &n_packed_draft);
+                            }
+                            if (nread_draft == 0) {
+                                throw std::runtime_error("Unable to restore draft slot snapshot state");
+                            }
+                            packed_draft.resize(n_packed_draft);
+                            if (packed_draft != packed) {
+                                throw std::runtime_error("Target and draft slot snapshot token payloads differ");
+                            }
+
+                            common_speculative_set_state(spec.get(), slot->id, manifest.spec_state);
+                            nread += nread_draft + sizeof(uint32_t) * 2 + sizeof(uint64_t) * 4 + manifest.spec_state.size();
+                        }
 
                         server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
 
@@ -2524,6 +3315,10 @@ private:
                         slot->prompt.tokens = std::move(restored);
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
+                        if (ctx_dft != nullptr) {
+                            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                            common_speculative_set_state(spec.get(), slot->id, {});
+                        }
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
@@ -3028,6 +3823,10 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        if (spec) {
+                            common_speculative_prompt_start(spec.get(), slot.id);
+                        }
+
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
@@ -3046,6 +3845,7 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+                        bool staged_prompt = false;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -3088,7 +3888,14 @@ private:
                                 return;
                             }
                         } else {
-                            if (slot.task->n_tokens() >= slot.n_ctx) {
+                            // A prompt-only request is the capacity probe for an
+                            // exactly-full context.  It does not need a free
+                            // position for generation, so allow n_prompt == n_ctx
+                            // when n_predict is explicitly zero.
+                            const bool exact_capacity_prefill =
+                                slot.task->n_tokens() == slot.n_ctx &&
+                                slot.task->params.n_predict == 0;
+                            if (slot.task->n_tokens() >= slot.n_ctx && !exact_capacity_prefill) {
                                 send_error(slot,
                                            string_format("request (%d tokens) exceeds the available context size (%d "
                                                          "tokens), try increasing it",
@@ -3230,7 +4037,21 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // Re-evaluating an exactly cached prompt removes its final token below
+                                // [TAG_PROMPT_LOGITS].  Include that token when deciding whether bounded
+                                // recurrent memory can roll back directly.  A checkpoint is required only
+                                // when the removal exceeds that bound, the context supports full removal
+                                // only, or the oldest retained SWA position is strictly newer than the
+                                // position the new suffix needs.  Equality is sufficient coverage.
+                                const size_t n_remove = slot.prompt.n_tokens() - n_past + (has_new_tokens ? 0 : 1);
+                                const bool needs_full_checkpoint =
+                                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL && n_remove > 0;
+                                const bool exceeds_rs_rollback =
+                                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                                    n_remove > llama_n_rs_seq(ctx_tgt);
+                                const bool missing_swa_prefix = pos_min > pos_min_thold;
+
+                                if (needs_full_checkpoint || exceeds_rs_rollback || missing_swa_prefix) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -3283,6 +4104,18 @@ private:
                             }
                         }
 
+                        if (qwen38_layer_major_eligible(slot, n_past)) {
+                            staged_prompt = qwen38_run_layer_major_prefill(slot);
+                            if (!slot.is_processing()) {
+                                return;
+                            }
+                            if (staged_prompt) {
+                                n_past = slot.prompt.n_tokens();
+                            } else {
+                                n_past = 0;
+                            }
+                        }
+
                         // [TAG_PROMPT_LOGITS]
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
@@ -3290,10 +4123,12 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
-                        slot.stats.n_prompt_cached    = n_past;
-                        slot.stats.n_prompt_processed = 0;
+                        slot.stats.n_prompt_cached = staged_prompt ? 0 : n_past;
+                        if (!staged_prompt) {
+                            slot.stats.n_prompt_processed = 0;
+                        }
 
-                        metrics.add_prompt_cached(n_past);
+                        metrics.add_prompt_cached(staged_prompt ? 0 : n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
 
@@ -3478,13 +4313,18 @@ private:
 
                         GGML_ASSERT(batch.size() > 0);
 
-                        // extract the logits only for the last token
-                        batch.set_output(batch.size() - 1, true);
-
                         slot.stats.n_gen = 0;
                         slot.i_batch     = batch.size() - 1;
 
-                        slot.init_sampler();
+                        if (!slot.task->params.prefill_only) {
+                            // Ordinary completion extracts logits only for the
+                            // final prompt token.  Phase-prefill deliberately
+                            // leaves every output flag clear so the graph ends
+                            // at the final transformer layer and never touches
+                            // the temporarily offloaded output tensor.
+                            batch.set_output(batch.size() - 1, true);
+                            slot.init_sampler();
+                        }
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
@@ -3700,6 +4540,23 @@ private:
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                if (slot.task->params.prefill_only) {
+                    // Keep the draft snapshot coherent with the target before
+                    // releasing the request.  This performs only the bounded
+                    // MTP suffix replay; the target's logits graph remains
+                    // absent because this branch runs after llama_decode().
+                    if (slot.can_speculate()) {
+                        common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    }
+
+                    slot.stats.update_prompt_last();
+                    slot.print_timings();
+                    send_final_response(slot);
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);

@@ -50,6 +50,18 @@ void quantize_row_q8_0_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
     quantize_row_q8_0_ref(x, y, k);
 }
 
+void quantize_row_q8_kv64(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q8_kv64_ref(x, y, k);
+}
+
+void quantize_row_q8_kv128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q8_kv128_ref(x, y, k);
+}
+
+void quantize_row_q8_kv256(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q8_kv256_ref(x, y, k);
+}
+
 void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q8_1_ref(x, y, k);
 }
@@ -476,6 +488,46 @@ void ggml_vec_dot_q8_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     }
 
     *s = sumf;
+}
+
+static void ggml_vec_dot_q8_kv_q8_0(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, size_t block_size, int qk, const void * GGML_RESTRICT vy, int nrc) {
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+
+    const char * x = (const char *) vx;
+    const block_q8_0 * y = (const block_q8_0 *) vy;
+    float sumf = 0.0f;
+
+    for (int iy = 0; iy < n/QK8_0; ++iy) {
+        const int i0 = iy*QK8_0;
+        const int ib = i0/qk;
+        const int ix = i0 % qk;
+        const ggml_half * xd = (const ggml_half *) (x + ib*block_size);
+        const int8_t * xq = (const int8_t *) (xd + 1);
+        int sumi = 0;
+        for (int j = 0; j < QK8_0; ++j) {
+            sumi += xq[ix + j]*y[iy].qs[j];
+        }
+        sumf += sumi*(GGML_CPU_FP16_TO_FP32(*xd)*GGML_CPU_FP16_TO_FP32(y[iy].d));
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_q8_kv64_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    UNUSED(bs); UNUSED(bx); UNUSED(by);
+    ggml_vec_dot_q8_kv_q8_0(n, s, vx, sizeof(block_q8_kv64), QK8_KV64, vy, nrc);
+}
+
+void ggml_vec_dot_q8_kv128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    UNUSED(bs); UNUSED(bx); UNUSED(by);
+    ggml_vec_dot_q8_kv_q8_0(n, s, vx, sizeof(block_q8_kv128), QK8_KV128, vy, nrc);
+}
+
+void ggml_vec_dot_q8_kv256_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    UNUSED(bs); UNUSED(bx); UNUSED(by);
+    ggml_vec_dot_q8_kv_q8_0(n, s, vx, sizeof(block_q8_kv256), QK8_KV256, vy, nrc);
 }
 
 void ggml_vec_dot_tq1_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {

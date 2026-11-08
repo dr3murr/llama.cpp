@@ -153,6 +153,23 @@ static __device__ void quantize_f32_q8_0_block(const float * __restrict__ x, blo
     }
 }
 
+template<typename block_t, int qk>
+static __device__ void quantize_f32_q8_kv_block(const float * __restrict__ x, block_t * __restrict__ y) {
+    float amax = 0.0f;
+
+    for (int j = 0; j < qk; ++j) {
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+
+    const float d  = amax / 127.0f;
+    const float id = d ? 1.0f/d : 0.0f;
+    y->d = d;
+
+    for (int j = 0; j < qk; ++j) {
+        y->qs[j] = roundf(x[j]*id);
+    }
+}
+
 static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, block_iq4_nl * __restrict__ y) {
     float amax = 0.0f;
     float vmax = 0.0f;
@@ -205,6 +222,18 @@ static __device__ void cpy_blck_f32_q5_1(const char * cxi, char * cdsti) {
 
 static __device__ void cpy_blck_f32_q8_0(const char * cxi, char * cdsti) {
     quantize_f32_q8_0_block((const float *)cxi, (block_q8_0 *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_q8_kv64(const char * cxi, char * cdsti) {
+    quantize_f32_q8_kv_block<block_q8_kv64, QK8_KV64>((const float *) cxi, (block_q8_kv64 *) cdsti);
+}
+
+static __device__ void cpy_blck_f32_q8_kv128(const char * cxi, char * cdsti) {
+    quantize_f32_q8_kv_block<block_q8_kv128, QK8_KV128>((const float *) cxi, (block_q8_kv128 *) cdsti);
+}
+
+static __device__ void cpy_blck_f32_q8_kv256(const char * cxi, char * cdsti) {
+    quantize_f32_q8_kv_block<block_q8_kv256, QK8_KV256>((const float *) cxi, (block_q8_kv256 *) cdsti);
 }
 
 static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {

@@ -430,7 +430,10 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_Q8_KV64 = 43,
+        GGML_TYPE_Q8_KV128 = 44,
+        GGML_TYPE_Q8_KV256 = 45,
+        GGML_TYPE_COUNT   = 46,
     };
 
     // precision
@@ -443,6 +446,24 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+    };
+
+    // Private Qwen3.8 cache-store tag.  It lets the CUDA SET_ROWS backend
+    // maintain a SageAttention-native resident cache while the graph keeps the
+    // ordinary Q8_KV256 allocation size and public cache-type contract.
+    #define GGML_QWEN38_SAGE_SET_ROWS_MAGIC 0x53414745u
+    enum ggml_qwen38_sage_cache_kind {
+        GGML_QWEN38_SAGE_CACHE_NONE = 0,
+        GGML_QWEN38_SAGE_CACHE_K    = 1,
+        GGML_QWEN38_SAGE_CACHE_V    = 2,
+    };
+
+    struct ggml_qwen38_sage_set_rows_params {
+        uint32_t magic;
+        uint32_t kind;
+        uint32_t capacity;
+        uint32_t reserved;
+        uint32_t layer;
     };
 
     // model file types
@@ -574,6 +595,12 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+
+        // Private Qwen3.8/Pascal decode path. This op is intentionally narrow:
+        // one F32 token in, one F32 token out, with source-exact packed weights
+        // owned by the CUDA backend. It is not part of the portable GGML ABI.
+        GGML_OP_QWEN38_PASCAL_FFN,
+        GGML_OP_QWEN38_PASCAL_GDN_IN,
 
         GGML_OP_UNARY,
 
@@ -2648,6 +2675,22 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Private single-token Qwen3.8 FFN for SM60. The CUDA backend must have a
+    // matching packed layer registered before a graph containing this op runs.
+    // The residual addition is fused into the result.
+    GGML_API struct ggml_tensor * ggml_qwen38_pascal_ffn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * normalized,
+            struct ggml_tensor  * residual,
+            int32_t               layer);
+
+    // Private single-token Qwen3.8 fused QKV + Z projection for SM60. The
+    // result is [10240 QKV values, 6144 Z values], all F32.
+    GGML_API struct ggml_tensor * ggml_qwen38_pascal_gdn_in(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * normalized,
+            int32_t               layer);
 
     // custom operators
 

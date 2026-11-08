@@ -113,6 +113,13 @@ export { portalToBody } from './portal-to-body';
 // Precision utilities
 export { normalizeFloatingPoint, normalizeNumber } from './precision';
 
+// Generated-text degeneration guard
+export {
+	findRepeatedSuffix,
+	type RepeatedSuffix,
+	type RepeatedSuffixOptions
+} from './repetition-loop';
+
 // Syntax highlighting utilities
 export { getLanguageFromFilename } from './syntax-highlight-language';
 

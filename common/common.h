@@ -385,7 +385,16 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            // Any verifier that can submit multiple target positions needs
+            // recurrent-state rollback on hybrid GDN models.  The draft-model
+            // implementations already requested it; ngram-simple reaches the
+            // same target verification path and must not silently fall back to
+            // a non-rollback target context.
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
+                   t == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -915,6 +924,7 @@ struct common_init_result {
 
     llama_model * model();
     llama_context * context();
+    void replace_context(llama_context * context);
 
     common_sampler * sampler(llama_seq_id seq_id);
     void reset_samplers();
@@ -956,6 +966,7 @@ struct common_threadpools {
     common_threadpools & operator=(const common_threadpools &) = delete;
 
     void init(llama_context * ctx, const common_params & params);
+    void attach(llama_context * ctx) const;
 
 private:
     ggml_threadpool * threadpool       = nullptr;

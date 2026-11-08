@@ -42,12 +42,14 @@ import type {
 } from '$lib/types';
 import {
 	findMessageById,
+	findRepeatedSuffix,
 	formatCwdMessage,
 	getConversationModel,
 	isAbortError,
 	normalizeModelName
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
+import { toast } from 'svelte-sonner';
 
 class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	chatReasoningStates = new SvelteMap<string, boolean>();
@@ -836,7 +838,9 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		let streamedReasoningContent = '';
 		let resolvedModel: string | null = null;
 		let modelPersisted = false;
+		let repetitionGuardStopped = false;
 
+		const repetitionGuardLastScan = { answer: 0, reasoning: 0 };
 		const convId = assistantMessage.convId;
 
 		// Tracks the last message created in this flow. Used as the parent for the next
@@ -897,11 +901,52 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		this.processing.setActiveConversation(convId);
 		const abortController = this.getOrCreateAbortController(convId);
+		const stopRepeatedGeneration = (generatedText: string, channel: 'answer' | 'reasoning') => {
+			if (repetitionGuardStopped || generatedText.length - repetitionGuardLastScan[channel] < 128) {
+				return false;
+			}
+
+			repetitionGuardLastScan[channel] = generatedText.length;
+			const repeated = findRepeatedSuffix(generatedText);
+
+			if (!repeated) return false;
+
+			repetitionGuardStopped = true;
+			toast.warning(
+				`Stopped a repeated ${channel} cycle (${repeated.periodChars} characters repeated ${repeated.repetitions} times).`,
+				{
+					action: {
+						label: 'Use Qwen3.8 preset',
+						onClick: () => {
+							settingsStore.updateMultipleConfig({
+								min_p: 0,
+								presence_penalty: 0,
+								repeat_penalty: 1,
+								temperature: 1,
+								top_k: 20,
+								top_p: 0.95
+							});
+							toast.success('Applied the official Qwen3.8 thinking sampler. Regenerate the turn.');
+						}
+					},
+					duration: 20000
+				}
+			);
+
+			// Preserve the partial turn and terminate the server-side stream. This
+			// follows the same path as the Stop button, so detached generation does
+			// not continue consuming the remaining output budget.
+			void this.stopGenerationForChat(convId);
+
+			return true;
+		};
 		const streamCallbacks: ChatStreamCallbacks = {
 			createAssistantMessage: async () => {
 				// Reset streaming state for new message
 				streamedContent = '';
 				streamedReasoningContent = '';
+				repetitionGuardLastScan.answer = 0;
+				repetitionGuardLastScan.reasoning = 0;
 
 				const msg = await DatabaseService.createMessageBranch(
 					{
@@ -1016,6 +1061,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				streamedContent += chunk;
 				updateStreamingUI();
 				this.setChatReasoning(convId, false);
+				stopRepeatedGeneration(streamedContent, 'answer');
 			},
 			onCompletionId: (id: string) => recordCompletionId(id),
 			onError: async (error: Error) => {
@@ -1087,6 +1133,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					reasoningContent: streamedReasoningContent
 				});
 				this.setChatReasoning(convId, true);
+				stopRepeatedGeneration(streamedReasoningContent, 'reasoning');
 			},
 			onTimings: (timings?: ChatMessageTimings, promptProgress?: ChatMessagePromptProgress) => {
 				this.processing.applyStreamTimings(timings, promptProgress, convId);

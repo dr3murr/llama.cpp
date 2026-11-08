@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <clocale>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <vector>
 
@@ -47,6 +48,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     constexpr uint32_t  n_rollback = 3;
     constexpr uint32_t  n_replay   = 40; // > n_ubatch so each seq spans multiple ubatches
     constexpr llama_pos p0         = n_prompt - n_rollback;
+    const bool greedy_only = std::getenv("QWEN38_ROLLBACK_GREEDY_ONLY") != nullptr;
 
     const auto make_ctx_multi = [&]() {
         auto cparams = common_context_params_to_llama(params);
@@ -134,6 +136,7 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     float    diff_max  = 0.0f;
     uint32_t seq_first = 0;
     int32_t  pos_first = -1;
+    int32_t  greedy_mismatches = 0;
     for (uint32_t i = 0; i < n_seqs*n_replay; ++i) {
         const float * l_roll = llama_get_logits_ith(ctx_roll, i);
         const float * l_ref  = llama_get_logits_ith(ctx_ref,  i);
@@ -142,7 +145,15 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
             cleanup();
             return false;
         }
+        int token_roll = 0;
+        int token_ref  = 0;
         for (int t = 0; t < n_vocab; ++t) {
+            if (l_roll[t] > l_roll[token_roll]) {
+                token_roll = t;
+            }
+            if (l_ref[t] > l_ref[token_ref]) {
+                token_ref = t;
+            }
             const float diff = std::fabs(l_roll[t] - l_ref[t]);
             if (diff > eps && pos_first < 0) {
                 seq_first = i/n_replay;
@@ -150,16 +161,19 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
             }
             diff_max = std::max(diff_max, diff);
         }
+        greedy_mismatches += token_roll != token_ref;
     }
 
-    if (diff_max > eps) {
-        fprintf(stderr, "%s : multi-seq split replay logits mismatch (max diff %g, first at seq %u pos %d)\n",
-                __func__, (double) diff_max, seq_first, pos_first);
+    if (greedy_mismatches > 0 || (diff_max > eps && !greedy_only)) {
+        fprintf(stderr, "%s : multi-seq split replay logits mismatch "
+                "(max diff %g, first at seq %u pos %d, greedy mismatches %d)\n",
+                __func__, (double) diff_max, seq_first, pos_first, greedy_mismatches);
         cleanup();
         return false;
     }
 
-    fprintf(stderr, "%s : multi-seq split replay matched (max diff %g)\n", __func__, (double) diff_max);
+    fprintf(stderr, "%s : multi-seq split replay matched (max diff %g, greedy mismatches %d%s)\n",
+            __func__, (double) diff_max, greedy_mismatches, greedy_only ? ", relaxed mixed-precision mode" : "");
 
     // seq-1-only decodes must be independent of seq 0's content: diverge seq 0
     // in ctx_ref only, then compare identical seq-1-only continuations bitwise
@@ -293,7 +307,7 @@ int main(int argc, char ** argv) {
 
     constexpr float eps = 1e-5f;
     std::vector<std::vector<float>> logits_src_replay(n_rollback);
-    const auto replay_and_compare = [&](const char * mode) {
+    const auto replay_and_compare = [&](const char * mode, bool capture_reference) {
         for (uint32_t i = 0; i < n_rollback; ++i) {
             const llama_pos pos = rollback_pos + i;
             if (!decode_one(ctx_src, tokens[pos], pos) ||
@@ -309,7 +323,6 @@ int main(int argc, char ** argv) {
                 return false;
             }
 
-            logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
             for (int token = 0; token < n_vocab; ++token) {
                 if (std::fabs(logits_src[token] - logits_dst[token]) > eps) {
                     fprintf(stderr, "%s : %s logits mismatch at position %d, token %d (%g != %g)\n",
@@ -317,10 +330,13 @@ int main(int argc, char ** argv) {
                     return false;
                 }
             }
+            if (capture_reference) {
+                logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
+            }
         }
         return true;
     };
-    if (!replay_and_compare("full")) {
+    if (!replay_and_compare("full", true)) {
         return 1;
     }
 
@@ -335,7 +351,7 @@ int main(int argc, char ** argv) {
     ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
     ckpt_partial.load_tgt(ctx_dst, 0, partial_flags);
 
-    if (!replay_and_compare("partial")) {
+    if (!replay_and_compare("partial", false)) {
         return 1;
     }
 
